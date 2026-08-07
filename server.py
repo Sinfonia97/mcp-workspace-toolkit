@@ -24,10 +24,19 @@ be launched BY a client (like Claude Desktop) that speaks the protocol over
 stdin/stdout. See README.md for how to wire it up.
 """
 
+import os
 from difflib import unified_diff
 from pathlib import Path
 
+import requests
+from dotenv import load_dotenv
 from mcp.server import MCPServer
+
+# Load HA_URL and HA_TOKEN from the .env file in this folder into the
+# process environment. .env is gitignored — this is what keeps the token
+# out of the code and out of GitHub, while still letting the server read
+# it at startup via os.environ.
+load_dotenv()
 
 # The name here is what shows up in Claude Desktop's tool/server list.
 mcp = MCPServer("workspace-toolkit")
@@ -71,6 +80,21 @@ def _resolve_safe_path(user_path: str) -> Path:
         )
 
     return candidate
+
+
+# -----------------------------------------------------------------------
+# HA_URL / HA_TOKEN
+#
+# Read from the environment (populated by load_dotenv() above, from the
+# .env file). These are NOT hardcoded in this file on purpose — unlike
+# ALLOWED_BASE_DIR, a token is a secret, and secrets never belong in code
+# that might end up in git history, even a private repo.
+#
+# If either is missing (e.g. .env wasn't filled in), get_entity_state
+# below returns a clear error instead of crashing the whole server.
+# -----------------------------------------------------------------------
+HA_URL = os.environ.get("HA_URL", "").rstrip("/")
+HA_TOKEN = os.environ.get("HA_TOKEN", "")
 
 
 # -----------------------------------------------------------------------
@@ -328,6 +352,82 @@ def write_file(path: str, content: str, mode: str = "overwrite", dry_run: bool =
         return f"Error writing '{path}': {e}"
 
     return f"{action} '{path}'.{backup_note}"
+
+
+# -----------------------------------------------------------------------
+# TOOL 6: get_entity_state
+#
+# The first DOMAIN-SPECIFIC tool — it doesn't know about files at all.
+# Instead it talks to Home Assistant's own REST API to ask "what is this
+# entity's value RIGHT NOW", which is different from what read_file on a
+# template YAML gives you (the LOGIC that computes the value, not the
+# live result).
+#
+# Key differences from the filesystem tools above:
+#   - No _resolve_safe_path() involved — there's no path here, just an
+#     entity_id string, and Home Assistant's own API decides what's
+#     valid, not this server.
+#   - Requires authentication (the Bearer token), unlike the Samba share
+#     which just relied on your existing Windows session.
+#   - Talks over HTTP to a live service that might be down, slow, or
+#     unreachable — so this needs its own error handling for network
+#     problems, separate from file-not-found style errors.
+# -----------------------------------------------------------------------
+@mcp.tool()
+def get_entity_state(entity_id: str) -> str:
+    """Get the current live state and attributes of a Home Assistant entity.
+
+    entity_id is the full Home Assistant entity ID, e.g.
+    "switch.washer_power_2" or "sensor.dryer_current_status".
+
+    Returns the entity's current state value (e.g. "running", "on",
+    "off") plus its attributes, as reported live by Home Assistant right
+    now. This is different from read_file on a template YAML file, which
+    shows the LOGIC that computes a value, not the current live result.
+    Use this when you need to know what's happening right now; use
+    read_file/list_directory when you need to see or edit configuration.
+    """
+    if not HA_URL or not HA_TOKEN:
+        return (
+            "Error: HA_URL or HA_TOKEN is not configured. Check that "
+            ".env exists in the project folder and HA_TOKEN has been "
+            "filled in with a real long-lived access token."
+        )
+
+    url = f"{HA_URL}/api/states/{entity_id}"
+    headers = {
+        "Authorization": f"Bearer {HA_TOKEN}",
+        "Content-Type": "application/json",
+    }
+
+    try:
+        response = requests.get(url, headers=headers, timeout=10)
+    except requests.exceptions.ConnectionError:
+        return (
+            f"Error: could not reach Home Assistant at {HA_URL}. "
+            f"Confirm it's running and the address is correct."
+        )
+    except requests.exceptions.Timeout:
+        return f"Error: request to Home Assistant timed out after 10 seconds."
+
+    if response.status_code == 401:
+        return "Error: authentication failed (401). The token in .env may be invalid or expired."
+    if response.status_code == 404:
+        return f"Error: entity '{entity_id}' was not found in Home Assistant."
+    if response.status_code != 200:
+        return f"Error: Home Assistant returned status {response.status_code}."
+
+    data = response.json()
+    state = data.get("state", "unknown")
+    attributes = data.get("attributes", {})
+
+    lines = [f"{entity_id}: {state}"]
+    if attributes:
+        lines.append("Attributes:")
+        for key, value in attributes.items():
+            lines.append(f"  {key}: {value}")
+
+    return "\n".join(lines)
 
 
 # -----------------------------------------------------------------------

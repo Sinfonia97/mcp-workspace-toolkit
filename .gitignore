@@ -1,3 +1,6 @@
+# Secrets — never commit. Holds HA_URL / HA_TOKEN.
+.env
+
 # Virtual environment — machine-specific, never commit
 venv/
 
