@@ -431,6 +431,309 @@ def get_entity_state(entity_id: str) -> str:
 
 
 # -----------------------------------------------------------------------
+# _check_ha_config
+#
+# Shared helper used by BOTH reload tools below. Calls Home Assistant's
+# config validation endpoint, which checks your YAML for errors WITHOUT
+# applying anything — same idea as write_file's dry_run, just on HA's
+# own config instead of a single file. Returns (is_valid, message) so
+# each calling tool can decide what to do with the result.
+# -----------------------------------------------------------------------
+def _check_ha_config() -> tuple[bool, str]:
+    if not HA_URL or not HA_TOKEN:
+        return False, "Error: HA_URL or HA_TOKEN is not configured in .env."
+
+    url = f"{HA_URL}/api/config/core/check_config"
+    headers = {
+        "Authorization": f"Bearer {HA_TOKEN}",
+        "Content-Type": "application/json",
+    }
+
+    try:
+        response = requests.post(url, headers=headers, timeout=30)
+    except (requests.exceptions.ConnectionError, requests.exceptions.Timeout):
+        return False, f"Error: could not reach Home Assistant at {HA_URL}."
+
+    if response.status_code != 200:
+        return False, f"Error: config check request failed with status {response.status_code}."
+
+    data = response.json()
+    if data.get("result") == "valid":
+        return True, "Config check passed: no errors found."
+
+    errors = data.get("errors") or "(no error detail returned)"
+    return False, f"Config check FAILED. Errors:\n{errors}"
+
+
+# -----------------------------------------------------------------------
+# TOOL 7: reload_ha_templates
+#
+# Narrower reload — only re-reads template entities, not the whole
+# config. Faster, but you've found it sometimes doesn't pick up every
+# change, which is why reload_ha_full_config (below) also exists as a
+# fallback.
+#
+# Both reload tools share the SAME shape: check config first via
+# _check_ha_config(), and only call the actual reload service if that
+# check passed. This mirrors write_file's "never act on an unvalidated
+# change" philosophy — just applied to Home Assistant's live config
+# instead of a single file on disk.
+# -----------------------------------------------------------------------
+@mcp.tool()
+def reload_ha_templates() -> str:
+    """Check Home Assistant's config for errors, then reload template entities.
+
+    Always validates the current YAML config first (the same check Home
+    Assistant's UI runs before a reload). If the check finds errors, this
+    tool stops and returns those errors WITHOUT reloading anything —
+    reloading invalid config could break running entities. Only if the
+    check passes does it call the template.reload service.
+
+    This is narrower/faster than reload_ha_full_config, but only affects
+    template-defined entities. If a change doesn't seem to take effect
+    after this, try reload_ha_full_config instead.
+    """
+    is_valid, message = _check_ha_config()
+    if not is_valid:
+        return message
+
+    url = f"{HA_URL}/api/services/template/reload"
+    headers = {
+        "Authorization": f"Bearer {HA_TOKEN}",
+        "Content-Type": "application/json",
+    }
+
+    try:
+        response = requests.post(url, headers=headers, timeout=30)
+    except (requests.exceptions.ConnectionError, requests.exceptions.Timeout):
+        return f"Error: config check passed, but could not reach Home Assistant to reload."
+
+    if response.status_code != 200:
+        return f"Error: config check passed, but reload request failed with status {response.status_code}."
+
+    return f"{message}\nTemplates reloaded successfully."
+
+
+# -----------------------------------------------------------------------
+# TOOL 8: reload_ha_full_config
+#
+# Broader reload — homeassistant.reload_core_config re-reads the entire
+# YAML configuration tree, affecting more integrations than just
+# templates. Use when a narrower reload (like reload_ha_templates) isn't
+# enough to pick up a change. Same check-then-act shape as above.
+# -----------------------------------------------------------------------
+@mcp.tool()
+def reload_ha_full_config() -> str:
+    """Check Home Assistant's config for errors, then reload the FULL configuration.
+
+    Always validates the current YAML config first, exactly like
+    reload_ha_templates. If the check finds errors, this tool stops and
+    returns those errors WITHOUT reloading anything.
+
+    This is broader than reload_ha_templates — it calls
+    homeassistant.reload_core_config, which re-reads the entire YAML
+    config tree rather than just template entities. Use this when a
+    narrower reload doesn't seem to pick up a change.
+    """
+    is_valid, message = _check_ha_config()
+    if not is_valid:
+        return message
+
+    url = f"{HA_URL}/api/services/homeassistant/reload_core_config"
+    headers = {
+        "Authorization": f"Bearer {HA_TOKEN}",
+        "Content-Type": "application/json",
+    }
+
+    try:
+        response = requests.post(url, headers=headers, timeout=30)
+    except (requests.exceptions.ConnectionError, requests.exceptions.Timeout):
+        return f"Error: config check passed, but could not reach Home Assistant to reload."
+
+    if response.status_code != 200:
+        return f"Error: config check passed, but reload request failed with status {response.status_code}."
+
+    return f"{message}\nFull configuration reloaded successfully."
+
+
+# -----------------------------------------------------------------------
+# TOOL 9: test_ha_template
+#
+# The tool most directly aimed at your actual workflow: iterating on
+# Jinja2 template logic BEFORE it goes anywhere near a real file. Home
+# Assistant has a dedicated /api/template endpoint that renders a raw
+# template string against LIVE entity states and returns the result —
+# nothing is saved, nothing is deployed. It's the templating equivalent
+# of write_file's dry_run: try it, see the result, iterate, and only
+# once it's right does the finished template go into a real file via
+# write_file.
+#
+# This closes the loop on template development:
+#   1. get_entity_state / ha://entities — see what data is available
+#   2. test_ha_template — iterate on the Jinja2 logic against that data
+#   3. write_file (dry_run, then committed) — save the finished template
+#   4. reload_ha_templates — apply it live
+# -----------------------------------------------------------------------
+@mcp.tool()
+def test_ha_template(template: str) -> str:
+    """Render a Jinja2 template string against live Home Assistant data.
+
+    Pass a raw Jinja2 template, e.g.
+    "{{ states('sensor.washer_current_status') }}" or something more
+    complex using states, is_state, or any Jinja2 logic Home Assistant
+    templates support. It's evaluated against LIVE current entity states
+    and the rendered result is returned as plain text.
+
+    Nothing is saved or deployed — this is purely for testing template
+    logic before putting it into a real file with write_file. Use this
+    to iterate on tricky template logic (e.g. mapping a raw status value
+    to a friendly label) and confirm it produces the expected output
+    before committing it to templates/sensor/*.yaml.
+    """
+    if not HA_URL or not HA_TOKEN:
+        return "Error: HA_URL or HA_TOKEN is not configured in .env."
+
+    url = f"{HA_URL}/api/template"
+    headers = {
+        "Authorization": f"Bearer {HA_TOKEN}",
+        "Content-Type": "application/json",
+    }
+
+    try:
+        response = requests.post(url, headers=headers, json={"template": template}, timeout=10)
+    except (requests.exceptions.ConnectionError, requests.exceptions.Timeout):
+        return f"Error: could not reach Home Assistant at {HA_URL}."
+
+    if response.status_code == 400:
+        # HA returns 400 with the Jinja2 error message in the body text
+        # when the template itself has a syntax error — surface that
+        # directly, since it's exactly the debugging info you'd want.
+        return f"Template error:\n{response.text}"
+    if response.status_code == 401:
+        return "Error: authentication failed (401). The token in .env may be invalid or expired."
+    if response.status_code != 200:
+        return f"Error: Home Assistant returned status {response.status_code}."
+
+    return f"Rendered result:\n{response.text}"
+
+
+# -----------------------------------------------------------------------
+# _BREAKING_CHANGE_KEYWORDS
+#
+# Home Assistant usually logs deprecation and breaking-change notices at
+# WARNING level, so a severity filter alone catches most of them. But
+# not always — some advisory messages don't follow that convention. This
+# keyword list is a safety net: lines containing any of these phrases are
+# ALWAYS included, regardless of severity, so a plain-INFO notice about
+# an upcoming breaking change doesn't get silently filtered out.
+# -----------------------------------------------------------------------
+_BREAKING_CHANGE_KEYWORDS = (
+    "deprecat",
+    "will be removed",
+    "will stop working",
+    "breaking change",
+    "no longer",
+    "migrat",
+)
+
+
+# -----------------------------------------------------------------------
+# TOOL 10: get_ha_error_log
+#
+# Fills the gap the other HA tools leave open: check_config catches YAML
+# SYNTAX errors before a reload, but it can't catch RUNTIME problems —
+# e.g. a template that's valid Jinja2 but references an entity that
+# doesn't exist, an integration that failed to connect, or a warning
+# that never surfaces anywhere in the HA UI. Those only show up here, in
+# the actual log.
+#
+# NOTE: this originally called Home Assistant's /api/error_log REST
+# endpoint, but that endpoint returns 404 as of HA 2025.11+ — HA removed
+# home-assistant.log by default and the REST API was never updated to
+# match (a known, widely-reported HA bug, not something wrong with this
+# server). The fix: HA has a CLI option (`ha core options
+# --duplicate-log-file=true`) that restores the log FILE even though the
+# API stays broken. So this tool now reads that file directly off the
+# Samba share instead of calling HTTP — same _resolve_safe_path pattern
+# as read_file/list_directory, not the requests+Bearer-token pattern the
+# other HA tools use. If HA ever fixes the REST endpoint, this could be
+# switched back; for now the filesystem route is simpler AND more
+# reliable, since it's the exact same proven pattern as read_file.
+#
+# Filtering logic is unchanged: WARNING/ERROR/CRITICAL lines plus any
+# line matching _BREAKING_CHANGE_KEYWORDS, regardless of severity level.
+# Pass level="all" to see the full unfiltered file.
+# -----------------------------------------------------------------------
+@mcp.tool()
+def get_ha_error_log(lines: int = 40, level: str = "important") -> str:
+    """Get recent lines from Home Assistant's log file, filtered to what matters.
+
+    Reads home-assistant.log directly from the config folder (requires
+    the HA CLI option "duplicate-log-file" to be enabled, since HA
+    disabled this log file by default in recent versions).
+
+    lines controls how many matching lines to return (default 40, taken
+    from the end of the filtered log — the most recent matches).
+
+    level controls filtering:
+      - "important" (default): only WARNING/ERROR/CRITICAL lines, PLUS
+        any line mentioning a deprecation or breaking change (even at
+        INFO level) so upcoming issues aren't missed.
+      - "all": no filtering — return the raw log as-is.
+
+    This tool only returns log data; it doesn't analyze it. After calling
+    this, review the returned lines and propose fixes for anything that
+    looks like a real problem — that's a reasoning step, not something
+    this tool does on its own.
+    """
+    if level not in ("important", "all"):
+        return f"Error: level must be 'important' or 'all', got '{level}'."
+
+    try:
+        safe_path = _resolve_safe_path("home-assistant.log")
+    except ValueError as e:
+        return str(e)
+
+    if not safe_path.exists():
+        return (
+            "Error: home-assistant.log not found in the config folder. "
+            "This file requires the HA CLI option to be enabled: run "
+            "'ha core options --duplicate-log-file=true', then "
+            "'ha core rebuild' and 'ha core restart'."
+        )
+
+    try:
+        log_text = safe_path.read_text(encoding="utf-8", errors="replace")
+    except OSError as e:
+        return f"Error reading home-assistant.log: {e}"
+
+    all_lines = log_text.splitlines()
+    if not all_lines:
+        return "Log is empty."
+
+    if level == "all":
+        matched = all_lines
+    else:
+        matched = [
+            line for line in all_lines
+            if " WARNING " in line
+            or " ERROR " in line
+            or " CRITICAL " in line
+            or any(keyword in line.lower() for keyword in _BREAKING_CHANGE_KEYWORDS)
+        ]
+        if not matched:
+            return (
+                "No WARNING/ERROR/CRITICAL or breaking-change lines found "
+                "in the current log. Pass level=\"all\" to see the full "
+                "unfiltered log instead."
+            )
+
+    recent = matched[-lines:]
+    label = "matching" if level == "important" else "raw"
+    return f"Last {len(recent)} {label} line(s) of home-assistant.log:\n\n" + "\n".join(recent)
+
+
+# -----------------------------------------------------------------------
 # RESOURCE 1: ha://entities
 #
 # This is the first RESOURCE in this server, not a tool — an important
