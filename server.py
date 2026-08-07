@@ -431,6 +431,101 @@ def get_entity_state(entity_id: str) -> str:
 
 
 # -----------------------------------------------------------------------
+# RESOURCE 1: ha://entities
+#
+# This is the first RESOURCE in this server, not a tool — an important
+# distinction. A tool is an action Claude decides to invoke mid-conversation
+# ("I should call get_entity_state right now"). A resource is more like a
+# document: reference content a client can browse or load into context,
+# identified by a URI instead of called with arguments.
+#
+# The @mcp.resource() decorator takes a URI (or URI template, for
+# parameterized resources — not used here since this one takes no
+# arguments) instead of relying on the function being "called" the way a
+# tool is. "ha://" is just a made-up scheme name for this server, the
+# same way a real webpage uses "https://".
+#
+# This resource reuses HA_URL/HA_TOKEN and the same auth pattern as
+# get_entity_state, but calls Home Assistant's /api/states with no
+# entity_id — which returns EVERY entity at once, not just one.
+# -----------------------------------------------------------------------
+@mcp.resource("ha://entities")
+def ha_entities_resource() -> str:
+    """A live list of every Home Assistant entity and its current state.
+
+    Reference data, not a targeted lookup — use get_entity_state instead
+    when you already know the specific entity_id you want.
+    """
+    if not HA_URL or not HA_TOKEN:
+        return "Error: HA_URL or HA_TOKEN is not configured in .env."
+
+    url = f"{HA_URL}/api/states"
+    headers = {
+        "Authorization": f"Bearer {HA_TOKEN}",
+        "Content-Type": "application/json",
+    }
+
+    try:
+        response = requests.get(url, headers=headers, timeout=10)
+    except (requests.exceptions.ConnectionError, requests.exceptions.Timeout):
+        return f"Error: could not reach Home Assistant at {HA_URL}."
+
+    if response.status_code != 200:
+        return f"Error: Home Assistant returned status {response.status_code}."
+
+    entities = response.json()
+    lines = [f"{e['entity_id']}: {e['state']}" for e in entities]
+    return "\n".join(sorted(lines))
+
+
+# -----------------------------------------------------------------------
+# RESOURCE 2: ha://conventions
+#
+# A STATIC resource — no API call, no filesystem read, just fixed text
+# baked into this file. This is where project-specific domain knowledge
+# lives, so that ANY client talking to this server (not just a
+# conversation where you happened to mention it) automatically has this
+# context available. Update this text directly as you learn more quirks
+# about your own Home Assistant setup.
+# -----------------------------------------------------------------------
+@mcp.resource("ha://conventions")
+def ha_conventions_resource() -> str:
+    """Project-specific conventions and quirks for this Home Assistant setup.
+
+    Read this before proposing changes to templates.yaml, entity IDs, or
+    dashboard YAML, so suggestions match how this particular instance is
+    actually configured rather than generic Home Assistant assumptions.
+    """
+    return """\
+Home Assistant setup conventions for this project:
+
+- Templates are kept in a separate templates.yaml-style structure under
+  templates/<domain>/ (e.g. templates/sensor/), not inline in
+  configuration.yaml. Files use top-level list blocks like "- sensor:",
+  "- binary_sensor:", "- trigger: / sensor:".
+
+- LG ThinQ washer/dryer entities were migrated from the old SmartThinQ
+  LGE Sensors integration to the native LG ThinQ integration. The old
+  integration's entities were never removed from the registry, so new
+  entities collide on name and get a "_2" suffix. Decision made: use the
+  "_2"-suffixed entity IDs going forward rather than cleaning up the
+  registry. Known _2 entities: switch.washer_power_2,
+  sensor.washer_time_display_2, switch.dryer_power_2,
+  sensor.dryer_time_display_2, binary_sensor.washer_run_completed_2,
+  binary_sensor.dryer_run_completed_2.
+
+- Known raw state values for sensor.dryer_current_status: running,
+  pause, wrinkle_care, end, initial, error, power_off, cooling.
+
+- Known raw state values for sensor.washer_current_status: rinsing,
+  add_drain, frozen_prevent_pause, initial, refreshing, spinning,
+  detecting, reserved, prewash, frozen_prevent_running, power_off,
+  running, frozen_prevent_initial, error, detergent_amount, pause,
+  drying, rinse_hold, end.
+"""
+
+
+# -----------------------------------------------------------------------
 # Entry point.
 #
 # transport="stdio" means this process communicates with its client
