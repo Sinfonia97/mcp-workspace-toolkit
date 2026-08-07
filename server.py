@@ -24,6 +24,7 @@ be launched BY a client (like Claude Desktop) that speaks the protocol over
 stdin/stdout. See README.md for how to wire it up.
 """
 
+import json
 import os
 from difflib import unified_diff
 from pathlib import Path
@@ -95,6 +96,80 @@ def _resolve_safe_path(user_path: str) -> Path:
 # -----------------------------------------------------------------------
 HA_URL = os.environ.get("HA_URL", "").rstrip("/")
 HA_TOKEN = os.environ.get("HA_TOKEN", "")
+
+
+# -----------------------------------------------------------------------
+# _ha_ws_call
+#
+# Home Assistant's REST API (used by every tool so far) has NO way to
+# read or write dashboard/lovelace configuration — that's a real,
+# long-standing gap in HA itself, not something missing from this
+# server. Dashboards are only accessible through HA's WEBSOCKET API,
+# which is a fundamentally different protocol: a persistent connection
+# with an auth handshake, rather than a single authenticated HTTP
+# request like `requests.get(...)`.
+#
+# This helper opens a FRESH connection per call (connect → authenticate
+# → send one command → receive the result → close) rather than keeping
+# a connection open between tool calls. That's less efficient than a
+# persistent connection, but far simpler and safer for how MCP tools
+# work — each tool call is independent and stateless, so a connection
+# that outlives a single call would be extra complexity for no real
+# benefit here (dashboard edits are occasional, not high-frequency).
+#
+# Returns (success, data): on success, data is HA's "result" payload
+# (already a Python object, not a JSON string). On failure, data is a
+# human-readable error message string.
+# -----------------------------------------------------------------------
+def _ha_ws_call(message: dict, timeout: int = 15):
+    if not HA_URL or not HA_TOKEN:
+        return False, "HA_URL or HA_TOKEN is not configured in .env."
+
+    try:
+        import websocket
+    except ImportError:
+        return False, "The websocket-client package is not installed. Run: pip install -r requirements.txt"
+
+    # HA's WebSocket endpoint lives at the same host as the REST API,
+    # just with ws:// (or wss:// for https) instead of http(s)://, and
+    # a fixed /api/websocket path.
+    ws_url = HA_URL.replace("https://", "wss://").replace("http://", "ws://") + "/api/websocket"
+
+    try:
+        ws = websocket.create_connection(ws_url, timeout=timeout)
+    except Exception as e:
+        return False, f"Could not connect to Home Assistant WebSocket at {ws_url}: {e}"
+
+    try:
+        # Step 1: HA sends "auth_required" as soon as we connect.
+        hello = json.loads(ws.recv())
+        if hello.get("type") != "auth_required":
+            return False, f"Unexpected WebSocket handshake: {hello}"
+
+        # Step 2: authenticate with the same long-lived token used
+        # everywhere else in this server.
+        ws.send(json.dumps({"type": "auth", "access_token": HA_TOKEN}))
+        auth_result = json.loads(ws.recv())
+        if auth_result.get("type") != "auth_ok":
+            return False, f"WebSocket authentication failed: {auth_result.get('message', auth_result)}"
+
+        # Step 3: send the actual command. HA requires a unique "id" on
+        # every command; since each call gets a fresh connection, id=1
+        # is always valid here (it only needs to be unique WITHIN one
+        # connection, not across calls).
+        message = dict(message, id=1)
+        ws.send(json.dumps(message))
+        result = json.loads(ws.recv())
+
+        if not result.get("success", False):
+            error = result.get("error", {})
+            return False, f"Home Assistant rejected the command: {error.get('message', error)}"
+
+        return True, result.get("result")
+    except Exception as e:
+        return False, f"WebSocket communication error: {e}"
+    finally:
+        ws.close()
 
 
 # -----------------------------------------------------------------------
@@ -734,6 +809,435 @@ def get_ha_error_log(lines: int = 40, level: str = "important") -> str:
 
 
 # -----------------------------------------------------------------------
+# _SEARCH_SKIP_DIRS / _SEARCH_EXTENSIONS
+#
+# search_entity_references originally walked EVERY file under the config
+# folder with Path.rglob("*"), which timed out in practice — a real HA
+# config folder contains large, irrelevant subtrees (.storage internal
+# state, deps, tts cache, backups, custom_components caches) that were
+# all being read over the network as text before being discarded. Two
+# fixes, applied together:
+#   1. Skip these known-noise directories ENTIRELY, before descending
+#      into them — not after. This requires os.walk (which allows
+#      pruning dirnames in place) instead of rglob (which doesn't).
+#   2. Only read files with an extension that could plausibly contain a
+#      readable entity_id reference — YAML by default. This alone
+#      eliminates images, databases, and binary caches without needing
+#      to open them and fail on decode.
+# -----------------------------------------------------------------------
+_SEARCH_SKIP_DIRS = {
+    ".cloud", ".git", "__pycache__",
+    "deps", "tts", "backups", "media", "www",
+}
+_SEARCH_EXTENSIONS = {".yaml", ".yml"}
+
+# .storage is normally noise (auth, registries, cloud, energy, traces —
+# often large, never hand-editable) so it's deliberately NOT in
+# _SEARCH_SKIP_DIRS. Dashboards built through the HA UI (rather than
+# written as YAML) are stored here as extension-less JSON files named
+# "lovelace" or "lovelace.<dashboard_id>" — exactly the kind of place an
+# entity_id can be referenced (in a card config) without ever appearing
+# in a .yaml file at all. So instead of skipping .storage wholesale, only
+# files starting with "lovelace" inside it are read; everything else in
+# that folder is still skipped for speed.
+_STORAGE_DIR_NAME = ".storage"
+_STORAGE_FILE_PREFIX = "lovelace"
+
+
+def _search_lovelace_json(node, entity_id: str, view_title=None, card=None, key_path="", results=None):
+    """Recursively walk a parsed lovelace dashboard JSON structure for entity_id.
+
+    Unlike the plain-text line search used for YAML files, this actually
+    understands the dashboard's shape well enough to say WHAT kind of
+    thing referenced the entity_id, not just that the string appeared
+    somewhere in a JSON blob.
+
+    Tracks three pieces of "where am I" context while descending:
+      - view_title: updates whenever we enter a dict that has a "cards"
+        key (that's what makes a dict a "view" in lovelace's schema).
+      - card: updates whenever we enter a dict that has a "type" key
+        (that's what makes a dict a "card" — including nested cards
+        inside layout cards like vertical-stack, which have their own
+        "type" and their own nested "cards" list).
+      - key_path: the dotted/bracketed JSON path to the CURRENT node,
+        e.g. "views[0].cards[3].entity" — this is what lets two matches
+        inside the same card (e.g. "entity" and
+        "tap_action.target.entity_id") show up as distinguishable
+        results instead of two identical-looking lines.
+
+    When entity_id is found inside a string value, the result includes
+    the exact key_path AND a compact JSON dump of the enclosing card (or
+    the whole node, if no card) so you can visually recognize it by its
+    icon/name/other properties even when it has no title at all.
+    """
+    if results is None:
+        results = []
+
+    if isinstance(node, dict):
+        next_view_title = node.get("title") if "cards" in node else view_title
+        next_card = node if "type" in node else card
+        for key, value in node.items():
+            next_path = f"{key_path}.{key}" if key_path else key
+            _search_lovelace_json(value, entity_id, next_view_title, next_card, next_path, results)
+    elif isinstance(node, list):
+        for index, item in enumerate(node):
+            next_path = f"{key_path}[{index}]"
+            _search_lovelace_json(item, entity_id, view_title, card, next_path, results)
+    elif isinstance(node, str):
+        if entity_id in node:
+            if card is not None:
+                card_type = card.get("type", "unknown")
+                card_title = card.get("title") or card.get("name")
+                card_desc = f"{card_type} card" + (f" (title: '{card_title}')" if card_title else "")
+                # Compact JSON snippet of the whole card so it's visually
+                # identifiable even with no title — e.g. by its icon.
+                # Truncated so one giant card doesn't blow up the output.
+                snippet = json.dumps(card, ensure_ascii=False)
+                if len(snippet) > 200:
+                    snippet = snippet[:200] + "..."
+            else:
+                card_desc = "dashboard config (outside any card)"
+                snippet = None
+            view_desc = f"View '{view_title}' \u2192 " if view_title else ""
+            snippet_desc = f" | card contents: {snippet}" if snippet else ""
+            results.append(f"{view_desc}{card_desc} | matched field: {key_path}{snippet_desc}")
+
+    return results
+
+
+# -----------------------------------------------------------------------
+# TOOL 11: search_entity_references
+#
+# A different kind of filesystem tool from read_file/list_directory: this
+# one searches ACROSS every file in the config tree at once, rather than
+# operating on one file or folder you already know the name of. Useful
+# for a very concrete real-world need: before renaming or retiring an
+# entity_id, find every YAML file that references it, so you don't miss
+# one and leave a dangling reference behind.
+#
+# Uses os.walk (not Path.rglob) specifically so _SEARCH_SKIP_DIRS can be
+# pruned BEFORE descending into them, which is what actually fixes the
+# timeout — rglob has no equivalent pruning mechanism.
+#
+# Capped at a maximum number of results (documented in the docstring
+# below) so a very common entity_id doesn't return an unreadable wall of
+# text.
+# -----------------------------------------------------------------------
+@mcp.tool()
+def search_entity_references(entity_id: str, subfolder: str = "", max_results: int = 50) -> str:
+    """Search config files and dashboards for lines/cards referencing an entity_id.
+
+    entity_id is the text to search for, e.g. "switch.washer_power_2".
+
+    Two kinds of sources are searched, and results are labeled so you can
+    tell them apart at a glance:
+      - "[Config] path:line: <text>" — a plain-text match in a .yaml/.yml
+        file (entity definitions, automations, templates, etc.)
+      - "[Dashboard card] path: View 'X' -> <type> card (title: 'Y')" —
+        a match found by actually parsing a UI-built dashboard's JSON
+        structure (stored in .storage/lovelace*), identifying which view
+        and which card (by type and title) referenced the entity.
+
+    Known noise folders (deps, tts, backups, media, www, etc.) are
+    skipped for speed, since they can't meaningfully contain a
+    hand-written or UI-configured entity reference anyway.
+
+    subfolder optionally limits the search to one part of the config
+    tree, e.g. "templates", instead of searching everything. Leave empty
+    to search the whole config folder.
+
+    max_results caps how many matches are returned (default 50). If the
+    entity_id is very common, results may be truncated — the output will
+    say so explicitly if that happens.
+
+    Use this before renaming or retiring an entity_id, to find every
+    place that references it — including dashboard cards that would
+    otherwise silently break — so nothing gets missed.
+    """
+    try:
+        search_root = _resolve_safe_path(subfolder)
+    except ValueError as e:
+        return str(e)
+
+    if not search_root.exists():
+        return f"Error: '{subfolder}' does not exist in the allowed directory."
+
+    if not search_root.is_dir():
+        return f"Error: '{subfolder}' is a file, not a directory."
+
+    matches = []
+    truncated = False
+
+    for dirpath, dirnames, filenames in os.walk(search_root):
+        # Prune skip-listed and hidden directories BEFORE os.walk
+        # descends into them — this is what avoids the timeout, since
+        # it never even lists what's inside e.g. deps or backups.
+        # .storage is a special case: it starts with "." (which the
+        # general hidden-dir filter would otherwise block) but it's
+        # explicitly allowed through, since that's where lovelace
+        # dashboard files live (see _STORAGE_DIR_NAME above).
+        dirnames[:] = [
+            d for d in dirnames
+            if d not in _SEARCH_SKIP_DIRS
+            and (d == _STORAGE_DIR_NAME or not d.startswith("."))
+        ]
+
+        for filename in sorted(filenames):
+            file_path = Path(dirpath) / filename
+            is_yaml = file_path.suffix.lower() in _SEARCH_EXTENSIONS
+            is_lovelace_storage = (
+                Path(dirpath).name == _STORAGE_DIR_NAME
+                and filename.startswith(_STORAGE_FILE_PREFIX)
+            )
+            if not (is_yaml or is_lovelace_storage):
+                continue
+            try:
+                text = file_path.read_text(encoding="utf-8")
+            except (UnicodeDecodeError, OSError):
+                continue  # skip unreadable files silently
+
+            rel_path = file_path.relative_to(ALLOWED_BASE_DIR)
+
+            if is_lovelace_storage:
+                # Try real JSON parsing so results say WHAT kind of thing
+                # referenced the entity (a card, and what type/title),
+                # not just that the string appeared somewhere. Falls
+                # back to a generic label if the file isn't valid JSON
+                # (e.g. a future HA version changes the format) rather
+                # than silently skipping a real match.
+                try:
+                    data = json.loads(text)
+                except json.JSONDecodeError:
+                    if entity_id in text:
+                        matches.append(f"[Dashboard] {rel_path}: (could not parse as JSON; entity_id found in raw file)")
+                        if len(matches) >= max_results:
+                            truncated = True
+                            break
+                    continue
+
+                for description in _search_lovelace_json(data, entity_id):
+                    matches.append(f"[Dashboard card] {rel_path}: {description}")
+                    if len(matches) >= max_results:
+                        truncated = True
+                        break
+                if truncated:
+                    break
+                continue
+
+            # Plain YAML: line-based search, labeled [Config] so it's
+            # visually distinct from [Dashboard card] results — this is
+            # the actual answer to "how do I know this is a real entity
+            # definition/reference vs. just a dashboard card": the label
+            # itself, driven by which branch of this code found it.
+            for line_number, line in enumerate(text.splitlines(), start=1):
+                if entity_id in line:
+                    matches.append(f"[Config] {rel_path}:{line_number}: {line.strip()}")
+                    if len(matches) >= max_results:
+                        truncated = True
+                        break
+            if truncated:
+                break
+        if truncated:
+            break
+
+    if not matches:
+        return f"No references to '{entity_id}' found under '{subfolder or '.'}'."
+
+    header = f"Found {len(matches)} reference(s) to '{entity_id}':\n\n"
+    footer = (
+        f"\n\n(Results capped at {max_results}; there may be more matches "
+        f"not shown.)" if truncated else ""
+    )
+    return header + "\n".join(matches) + footer
+
+
+# -----------------------------------------------------------------------
+# TOOL 12: list_ha_dashboards
+#
+# Discovers real dashboard url_path values through the API, rather than
+# guessing from .storage filenames. The two don't always match exactly
+# (e.g. underscores in the filename vs. dashes in the actual url_path),
+# so this is the reliable way to find the right identifier to pass to
+# get_ha_dashboard_config / save_ha_dashboard_config below.
+# -----------------------------------------------------------------------
+@mcp.tool()
+def list_ha_dashboards() -> str:
+    """List all Home Assistant dashboards, their url_path, and edit mode.
+
+    Returns each dashboard's title, url_path, and mode ("storage" or
+    "yaml"). This distinction matters:
+      - mode "storage": UI-managed dashboards. Use get_ha_dashboard_config
+        and save_ha_dashboard_config (this server's WebSocket-based
+        tools) to view/edit them.
+      - mode "yaml": file-managed dashboards. save_ha_dashboard_config
+        will be REJECTED by Home Assistant for these — use read_file,
+        write_file, and search_entity_references on the underlying YAML
+        file instead (check configuration.yaml's "lovelace:" section for
+        the exact filename).
+
+    Use the url_path value (not a guessed filename) with
+    get_ha_dashboard_config and save_ha_dashboard_config.
+
+    Note: this lists dashboards registered as separate entries. The
+    default/main dashboard (if you haven't created others) may not
+    appear here — pass an empty url_path to the other tools to target it.
+    """
+    success, data = _ha_ws_call({"type": "lovelace/dashboards/list"})
+    if not success:
+        return f"Error: {data}"
+
+    if not data:
+        return "No additional dashboards found (only the default dashboard exists)."
+
+    lines = []
+    for dashboard in data:
+        title = dashboard.get("title", "(untitled)")
+        url_path = dashboard.get("url_path", "(unknown)")
+        mode = dashboard.get("mode", "unknown")
+        lines.append(f"{title}  (url_path: {url_path}, mode: {mode})")
+    return "\n".join(lines)
+
+
+# -----------------------------------------------------------------------
+# TOOL 13: get_ha_dashboard_config
+#
+# The API-based equivalent of read_file, but for dashboards specifically
+# — fetches the LIVE config Home Assistant is actually serving right
+# now, through the proper WebSocket command, rather than reading the
+# .storage file directly (which risks reading a stale copy if HA hasn't
+# flushed its in-memory state to disk yet).
+# -----------------------------------------------------------------------
+@mcp.tool()
+def get_ha_dashboard_config(url_path: str = "") -> str:
+    """Get a Home Assistant dashboard's current configuration as JSON.
+
+    url_path identifies which dashboard (from list_ha_dashboards). Leave
+    empty for the default/main dashboard.
+
+    Returns the full dashboard config (views, cards, everything) as
+    pretty-printed JSON. Use this to see the current structure before
+    proposing changes with save_ha_dashboard_config.
+    """
+    command = {"type": "lovelace/config"}
+    if url_path:
+        command["url_path"] = url_path
+
+    success, data = _ha_ws_call(command)
+    if not success:
+        return f"Error: {data}"
+
+    return json.dumps(data, indent=2, ensure_ascii=False)
+
+
+# -----------------------------------------------------------------------
+# TOOL 14: save_ha_dashboard_config
+#
+# This is the tool that actually replaces the "just edit the JSON file
+# directly" approach you were (rightly) uncomfortable with. Same
+# dry_run-by-default philosophy as write_file, but two real advantages
+# over a raw file write:
+#   1. LIVE APPLY — HA's lovelace/config/save command updates the
+#      running dashboard immediately. No restart needed, unlike editing
+#      .storage/lovelace* directly.
+#   2. SERVER-SIDE VALIDATION — if the config you pass is structurally
+#      invalid, HA's own save command rejects it with an error message
+#      BEFORE anything changes, the same safety net check_config gives
+#      YAML edits. A raw file write has no equivalent check at all.
+#
+# dry_run=True (the default) fetches the CURRENT config, diffs it
+# against your proposed config using the same unified_diff pattern as
+# write_file, and returns that diff WITHOUT saving anything. Only
+# dry_run=False actually calls the save command.
+# -----------------------------------------------------------------------
+@mcp.tool()
+def save_ha_dashboard_config(url_path: str, config: str, dry_run: bool = True) -> str:
+    """Save a Home Assistant dashboard's configuration.
+
+    ONLY works for "storage"-mode dashboards (check with
+    list_ha_dashboards first). "yaml"-mode dashboards are managed as
+    plain files and will be rejected here — use read_file, write_file,
+    and search_entity_references on the underlying YAML file instead.
+
+    url_path identifies which dashboard (from list_ha_dashboards). Use
+    an empty string for the default/main dashboard.
+
+    config is the COMPLETE dashboard configuration as a JSON string
+    (views, cards, everything) — this replaces the whole dashboard, the
+    same way write_file's "overwrite" mode replaces a whole file. Always
+    fetch the current config with get_ha_dashboard_config first, modify
+    it, and pass the complete result back here — don't try to pass a
+    partial config.
+
+    dry_run controls whether this actually saves anything:
+      - True (default): fetch the current config, compute a diff against
+        your proposed config, and return that diff WITHOUT saving.
+        Always call with dry_run=True first and confirm the diff looks
+        right before saving for real.
+      - False: actually save. Applies LIVE immediately (no HA restart
+        needed) through Home Assistant's own save command, which
+        validates the structure and rejects it with a clear error if
+        something is malformed — this is real validation, not just a
+        raw file write.
+    """
+    try:
+        proposed = json.loads(config)
+    except json.JSONDecodeError as e:
+        return f"Error: config is not valid JSON: {e}"
+
+    # Preemptively check the dashboard's mode before doing anything
+    # else. Home Assistant's own save command WOULD reject a yaml-mode
+    # dashboard anyway, but its raw error message is generic — this
+    # gives a clear, actionable answer up front instead: use the file
+    # tools, not this one, for that dashboard.
+    success, dashboards = _ha_ws_call({"type": "lovelace/dashboards/list"})
+    if success:
+        for dashboard in dashboards:
+            if dashboard.get("url_path") == (url_path or None) and dashboard.get("mode") == "yaml":
+                return (
+                    f"Error: dashboard '{url_path or '(default)'}' is in YAML mode, "
+                    f"not storage mode. Home Assistant does not allow saving YAML-mode "
+                    f"dashboards through the API — they're managed as plain files instead. "
+                    f"Use read_file / write_file / search_entity_references on the "
+                    f"underlying .yaml file (check configuration.yaml's \"lovelace:\" "
+                    f"section for the exact filename) instead of this tool."
+                )
+
+    fetch_command = {"type": "lovelace/config"}
+    if url_path:
+        fetch_command["url_path"] = url_path
+
+    success, current = _ha_ws_call(fetch_command)
+    if not success:
+        return f"Error fetching current config for diff: {current}"
+
+    if dry_run:
+        current_text = json.dumps(current, indent=2, ensure_ascii=False)
+        proposed_text = json.dumps(proposed, indent=2, ensure_ascii=False)
+        diff_lines = list(
+            unified_diff(
+                current_text.splitlines(keepends=True),
+                proposed_text.splitlines(keepends=True),
+                fromfile=f"dashboard '{url_path or '(default)'}' (current)",
+                tofile=f"dashboard '{url_path or '(default)'}' (proposed)",
+            )
+        )
+        if not diff_lines:
+            return "No changes: the proposed config is identical to the current one."
+        header = f"PREVIEW ONLY — nothing saved yet. Diff for dashboard '{url_path or '(default)'}':\n\n"
+        return header + "".join(diff_lines)
+
+    save_command = {"type": "lovelace/config/save", "config": proposed}
+    if url_path:
+        save_command["url_path"] = url_path
+
+    success, result = _ha_ws_call(save_command)
+    if not success:
+        return f"Error: Home Assistant rejected the save: {result}"
+
+    return f"Dashboard '{url_path or '(default)'}' saved and applied live."
+
+
+# -----------------------------------------------------------------------
 # RESOURCE 1: ha://entities
 #
 # This is the first RESOURCE in this server, not a tool — an important
@@ -825,6 +1329,56 @@ Home Assistant setup conventions for this project:
   detecting, reserved, prewash, frozen_prevent_running, power_off,
   running, frozen_prevent_initial, error, detergent_amount, pause,
   drying, rinse_hold, end.
+
+- Main dashboard is registered as a STORAGE-mode dashboard (url_path
+  "dashboard-main", title "Main") — editable via get_ha_dashboard_config
+  / save_ha_dashboard_config, same as "Appliances", "Map", and
+  "Overview". Do not assume it's YAML-mode just because ULM is
+  installed — always confirm mode with list_ha_dashboards first.
+
+- Separately, there are TWO yaml-mode dashboard systems installed:
+    - UI Lovelace Minimalist (ULM), url_paths "ui-lovelace-minimalist"
+      and "adaptive-dash". The "main" folder
+      (ui_lovelace_minimalist/dashboard/main/) is the PRIMARY, actively-
+      used ULM location — "adaptive-dash" is a separate, secondary ULM
+      instance. Do not confuse this with the storage-mode dashboard
+      titled "Main" (url_path "dashboard-main") described above; they
+      are unrelated despite the similar name. Root file:
+      ui_lovelace_minimalist/dashboard/ui-lovelace.yaml, which pulls in
+      card templates via !include_dir_merge_named from
+      custom_components/ui_lovelace_minimalist/__ui_minimalist__/ulm_templates/
+      (this is the ULM framework's OWN template library — part of the
+      installed integration, not user dashboard content; avoid editing
+      it directly since a HACS update could overwrite changes) and
+      views via individual !include lines pointing at
+      ui_lovelace_minimalist/dashboard/main/*.yaml and
+      ui_lovelace_minimalist/dashboard/main/rooms/*.yaml (several are
+      commented out — check the root file for which are currently
+      active before assuming a room view exists; disabled room
+      includes no longer have corresponding files in rooms/ at all,
+      confirming they're genuinely retired, not just toggled off).
+
+      main/home.yaml is the overview/landing view and itself includes
+      three more files as cards: main/sidebar.yaml, main/appt.yaml,
+      main/header.yaml. main/sidebar.yaml in turn includes all six
+      files under main/popups/ (security.yaml, lights.yaml,
+      sockets.yaml, doors.yaml, motion.yaml, battery.yaml) via
+      "popup_content: !include" lines — these render as clickable
+      sidebar menu items that open an overlay popup, NOT separate
+      dashboard tabs. This means popups/sockets.yaml, doors.yaml,
+      motion.yaml, and battery.yaml are still actively reachable
+      through the sidebar even though their corresponding top-level
+      VIEWS are commented out/retired in the root file — don't assume
+      a commented-out view means that content is fully inaccessible.
+    - Dwains Dashboard, url_path "dwains-dashboard" — structure not yet
+      explored.
+  Edit yaml-mode dashboards with read_file/write_file/
+  search_entity_references on their actual files, never
+  save_ha_dashboard_config (HA rejects that for yaml-mode dashboards).
+
+- The root-level ui-lovelace.yaml (directly in the config folder, NOT
+  inside ui_lovelace_minimalist/) is EMPTY — a harmless leftover from
+  before dashboards were split out; not in active use.
 """
 
 
