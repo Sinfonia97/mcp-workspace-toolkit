@@ -1,0 +1,13 @@
+# Virtual environment — machine-specific, never commit
+venv/
+
+# Python cache
+__pycache__/
+*.pyc
+
+# Backup files created automatically by write_file's dry_run/backup logic
+*.bak
+
+# Editor/OS noise
+.vscode/
+Thumbs.db
