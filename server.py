@@ -97,6 +97,23 @@ def _resolve_safe_path(user_path: str) -> Path:
 HA_URL = os.environ.get("HA_URL", "").rstrip("/")
 HA_TOKEN = os.environ.get("HA_TOKEN", "")
 
+# -----------------------------------------------------------------------
+# NODE_RED_URL / NODE_RED_USERNAME / NODE_RED_PASSWORD
+#
+# Node-RED is a COMPLETELY SEPARATE service from Home Assistant — its own
+# process, own port (default 1880), own auth system. It's not reachable
+# through anything above; it needs its own client logic entirely.
+#
+# Also unlike HA_TOKEN (a permanent long-lived token), Node-RED's admin
+# API uses short-lived access tokens obtained by logging in with a
+# username/password each time — there's no long-lived token to store.
+# So instead of a token, the .env file holds credentials, and
+# _node_red_login() below fetches a fresh token whenever a tool needs one.
+# -----------------------------------------------------------------------
+NODE_RED_URL = os.environ.get("NODE_RED_URL", "").rstrip("/")
+NODE_RED_USERNAME = os.environ.get("NODE_RED_USERNAME", "")
+NODE_RED_PASSWORD = os.environ.get("NODE_RED_PASSWORD", "")
+
 
 # -----------------------------------------------------------------------
 # _ha_ws_call
@@ -1235,6 +1252,822 @@ def save_ha_dashboard_config(url_path: str, config: str, dry_run: bool = True) -
         return f"Error: Home Assistant rejected the save: {result}"
 
     return f"Dashboard '{url_path or '(default)'}' saved and applied live."
+
+
+# -----------------------------------------------------------------------
+# _ha_config_api
+#
+# Home Assistant has a REST endpoint pattern used by its OWN frontend
+# editor for automations, scripts, and scenes: GET/POST/DELETE against
+# /api/config/<domain>/config/<item_id>. Unlike dashboards, this is
+# plain REST (no WebSocket needed) — but it's also not in the official
+# REST API docs; it's stable and widely relied-upon (the HA UI itself
+# uses it), just undocumented. Worth knowing if HA ever changes it.
+#
+# One helper, shared by every automation/script tool below, parameterized
+# by domain ("automation" or "script") and HTTP method — same spirit as
+# _ha_ws_call being shared by the dashboard tools.
+#
+# IMPORTANT BEHAVIOR: unlike write_file or save_ha_dashboard_config, a
+# POST to this endpoint both SAVES and APPLIES LIVE in one step — no
+# separate reload call needed. If a change doesn't seem to take effect,
+# reload_ha_full_config is a manual fallback, but shouldn't normally be
+# necessary.
+# -----------------------------------------------------------------------
+def _ha_config_api(method: str, domain: str, item_id: str, json_body: dict = None, timeout: int = 15):
+    if not HA_URL or not HA_TOKEN:
+        return False, "HA_URL or HA_TOKEN is not configured in .env."
+
+    url = f"{HA_URL}/api/config/{domain}/config/{item_id}"
+    headers = {
+        "Authorization": f"Bearer {HA_TOKEN}",
+        "Content-Type": "application/json",
+    }
+
+    try:
+        response = requests.request(method, url, headers=headers, json=json_body, timeout=timeout)
+    except (requests.exceptions.ConnectionError, requests.exceptions.Timeout):
+        return False, f"Could not reach Home Assistant at {HA_URL}."
+
+    if response.status_code == 401:
+        return False, "Authentication failed (401). The token in .env may be invalid or expired."
+    if response.status_code == 404:
+        return False, f"No {domain} found with id '{item_id}'."
+    if response.status_code not in (200, 201):
+        # HA typically returns a JSON body with validation error detail
+        # on a bad POST (e.g. malformed automation structure) — surface
+        # it directly, since it's exactly the debugging info needed.
+        try:
+            detail = response.json()
+        except ValueError:
+            detail = response.text
+        return False, f"Home Assistant returned status {response.status_code}: {detail}"
+
+    if method == "DELETE":
+        return True, None
+
+    try:
+        return True, response.json()
+    except ValueError:
+        return False, f"Home Assistant returned a non-JSON response: {response.text}"
+
+
+# -----------------------------------------------------------------------
+# TOOL 15: list_ha_automations
+#
+# There's no "list all automations" version of the config endpoint above
+# — you have to already know an automation's config id to fetch it. This
+# tool bridges that gap using the REGULAR states API (already used by
+# get_entity_state) filtered to the "automation." domain, extracting the
+# config id from each entity's "id" attribute (Home Assistant exposes it
+# there specifically so tools like this can look it up).
+# -----------------------------------------------------------------------
+@mcp.tool()
+def list_ha_automations() -> str:
+    """List all automations with their entity_id, name, current on/off state, and config id.
+
+    The config id (from each automation's "id" attribute) is what
+    get_ha_automation_config / save_ha_automation_config /
+    remove_ha_automation actually need — NOT the entity_id. Automations
+    without an "id" attribute (rare, usually very old ones) can't be
+    edited through the config API; note that in the output rather than
+    guessing.
+
+    Use this first whenever you need to find or confirm an automation's
+    config id before calling the other automation tools.
+    """
+    if not HA_URL or not HA_TOKEN:
+        return "Error: HA_URL or HA_TOKEN is not configured in .env."
+
+    url = f"{HA_URL}/api/states"
+    headers = {"Authorization": f"Bearer {HA_TOKEN}"}
+
+    try:
+        response = requests.get(url, headers=headers, timeout=10)
+    except (requests.exceptions.ConnectionError, requests.exceptions.Timeout):
+        return f"Error: could not reach Home Assistant at {HA_URL}."
+
+    if response.status_code != 200:
+        return f"Error: Home Assistant returned status {response.status_code}."
+
+    automations = [e for e in response.json() if e["entity_id"].startswith("automation.")]
+    if not automations:
+        return "No automations found."
+
+    lines = []
+    for entity in automations:
+        name = entity["attributes"].get("friendly_name", entity["entity_id"])
+        state = entity["state"]
+        config_id = entity["attributes"].get("id")
+        id_note = f"config id: {config_id}" if config_id else "no config id — not editable via config API"
+        lines.append(f"{name} ({entity['entity_id']}, {state}) — {id_note}")
+    return "\n".join(sorted(lines))
+
+
+# -----------------------------------------------------------------------
+# TOOL 16: get_ha_automation_config
+# -----------------------------------------------------------------------
+@mcp.tool()
+def get_ha_automation_config(automation_id: str) -> str:
+    """Get an automation's full configuration as JSON, by its config id.
+
+    automation_id is the CONFIG id (from list_ha_automations' output),
+    not the entity_id — e.g. "1733024053997", not "automation.my_alarm".
+
+    Returns the automation's trigger/condition/action structure as
+    pretty-printed JSON. Use this to see the current definition before
+    proposing changes with save_ha_automation_config.
+    """
+    success, data = _ha_config_api("GET", "automation", automation_id)
+    if not success:
+        return f"Error: {data}"
+    return json.dumps(data, indent=2, ensure_ascii=False)
+
+
+# -----------------------------------------------------------------------
+# TOOL 17: save_ha_automation_config
+#
+# Same dry_run-by-default diff-preview philosophy as write_file and
+# save_ha_dashboard_config. One difference worth knowing: this single
+# tool handles BOTH creating a new automation and updating an existing
+# one — Home Assistant's config API doesn't distinguish, it just
+# upserts to whatever id you POST to. To CREATE a new automation,
+# generate a fresh unique id yourself (a timestamp-like string, e.g.
+# str(int(time.time() * 1000)) works fine) and POST the full config to
+# that id — there's no separate "create" endpoint.
+# -----------------------------------------------------------------------
+@mcp.tool()
+def save_ha_automation_config(automation_id: str, config: str, dry_run: bool = True) -> str:
+    """Create or update an automation. Applies live immediately — no reload needed.
+
+    automation_id: the config id. For an EXISTING automation, get this
+    from list_ha_automations. For a NEW automation, make up a fresh
+    unique id (e.g. a millisecond timestamp string) — there's no
+    separate "create" call, POSTing to an id that doesn't exist yet
+    creates it.
+
+    config: the COMPLETE automation definition as a JSON string —
+    alias, trigger, condition, action, mode, etc. This replaces the
+    whole automation; always fetch the current config with
+    get_ha_automation_config first if you're editing an existing one.
+
+    dry_run controls whether this actually saves anything:
+      - True (default): fetch the current config (empty if this is a
+        new automation) and return a diff against your proposed config,
+        WITHOUT saving. Always call with dry_run=True first.
+      - False: actually save. Home Assistant validates the automation
+        structure server-side and rejects it with a clear error if
+        malformed — real validation, not just a raw file write. Applies
+        LIVE immediately; no separate reload call is needed.
+    """
+    try:
+        proposed = json.loads(config)
+    except json.JSONDecodeError as e:
+        return f"Error: config is not valid JSON: {e}"
+
+    # Fetch current state for the diff. A 404 here just means this is a
+    # brand-new automation — treat "current" as empty rather than
+    # treating the fetch failure as a hard error.
+    success, current = _ha_config_api("GET", "automation", automation_id)
+    current_text = json.dumps(current, indent=2, ensure_ascii=False) if success else ""
+
+    if dry_run:
+        proposed_text = json.dumps(proposed, indent=2, ensure_ascii=False)
+        diff_lines = list(
+            unified_diff(
+                current_text.splitlines(keepends=True),
+                proposed_text.splitlines(keepends=True),
+                fromfile=f"automation '{automation_id}' (current{'​' if success else ', does not exist yet'})",
+                tofile=f"automation '{automation_id}' (proposed)",
+            )
+        )
+        if not diff_lines:
+            return "No changes: the proposed config is identical to the current one."
+        header = f"PREVIEW ONLY — nothing saved yet. Diff for automation '{automation_id}':\n\n"
+        return header + "".join(diff_lines)
+
+    success, result = _ha_config_api("POST", "automation", automation_id, json_body=proposed)
+    if not success:
+        return f"Error: Home Assistant rejected the save: {result}"
+
+    return f"Automation '{automation_id}' saved and applied live."
+
+
+# -----------------------------------------------------------------------
+# TOOL 18: remove_ha_automation
+#
+# Same dry_run gating as the write/save tools above, but there's no
+# "diff" for a deletion — dry_run instead fetches and echoes back what
+# WOULD be deleted, so you can confirm it's the right one before it's
+# gone. Unlike write_file, there's no automatic backup here (HA's config
+# API has no equivalent of a .bak file) — the dry_run preview is the
+# only safety net, so treat it as mandatory in practice, not optional.
+# -----------------------------------------------------------------------
+@mcp.tool()
+def remove_ha_automation(automation_id: str, dry_run: bool = True) -> str:
+    """Delete an automation by its config id. No undo — always dry_run first.
+
+    automation_id: the config id (from list_ha_automations), not the
+    entity_id.
+
+    dry_run controls whether this actually deletes anything:
+      - True (default): fetch and return the automation's current
+        config so you can confirm it's the right one, WITHOUT deleting.
+      - False: actually delete it. There is no automatic backup for
+        this operation (unlike write_file's .bak) — if you might want
+        the config back, save it with get_ha_automation_config BEFORE
+        deleting.
+    """
+    success, current = _ha_config_api("GET", "automation", automation_id)
+    if not success:
+        return f"Error: {current}"
+
+    if dry_run:
+        current_text = json.dumps(current, indent=2, ensure_ascii=False)
+        return (
+            f"PREVIEW ONLY — nothing deleted yet. This automation would be removed:\n\n"
+            f"{current_text}"
+        )
+
+    success, _ = _ha_config_api("DELETE", "automation", automation_id)
+    if not success:
+        return f"Error: Home Assistant rejected the delete."
+
+    return f"Automation '{automation_id}' deleted."
+
+
+# -----------------------------------------------------------------------
+# TOOL 19: list_ha_scripts
+#
+# Scripts work slightly differently from automations: a script's config
+# id IS the same as its entity_id's object_id (the part after "script."),
+# not a separate hidden attribute. So this tool is simpler than
+# list_ha_automations — no need to dig through attributes.
+# -----------------------------------------------------------------------
+@mcp.tool()
+def list_ha_scripts() -> str:
+    """List all scripts with their entity_id, name, and config id.
+
+    Unlike automations, a script's config id is always the part of its
+    entity_id after "script." — e.g. entity_id "script.movie_mode" has
+    config id "movie_mode". This tool extracts that for convenience so
+    you don't have to do the string split yourself.
+    """
+    if not HA_URL or not HA_TOKEN:
+        return "Error: HA_URL or HA_TOKEN is not configured in .env."
+
+    url = f"{HA_URL}/api/states"
+    headers = {"Authorization": f"Bearer {HA_TOKEN}"}
+
+    try:
+        response = requests.get(url, headers=headers, timeout=10)
+    except (requests.exceptions.ConnectionError, requests.exceptions.Timeout):
+        return f"Error: could not reach Home Assistant at {HA_URL}."
+
+    if response.status_code != 200:
+        return f"Error: Home Assistant returned status {response.status_code}."
+
+    scripts = [e for e in response.json() if e["entity_id"].startswith("script.")]
+    if not scripts:
+        return "No scripts found."
+
+    lines = []
+    for entity in scripts:
+        name = entity["attributes"].get("friendly_name", entity["entity_id"])
+        state = entity["state"]
+        config_id = entity["entity_id"].split(".", 1)[1]
+        lines.append(f"{name} ({entity['entity_id']}, {state}) — config id: {config_id}")
+    return "\n".join(sorted(lines))
+
+
+# -----------------------------------------------------------------------
+# TOOL 20: get_ha_script_config
+# -----------------------------------------------------------------------
+@mcp.tool()
+def get_ha_script_config(script_id: str) -> str:
+    """Get a script's full configuration as JSON, by its config id.
+
+    script_id is the part of the entity_id after "script." — e.g.
+    "movie_mode" for entity_id "script.movie_mode" (see
+    list_ha_scripts).
+
+    Returns the script's sequence/fields structure as pretty-printed
+    JSON. Use this to see the current definition before proposing
+    changes with save_ha_script_config.
+    """
+    success, data = _ha_config_api("GET", "script", script_id)
+    if not success:
+        return f"Error: {data}"
+    return json.dumps(data, indent=2, ensure_ascii=False)
+
+
+# -----------------------------------------------------------------------
+# TOOL 21: save_ha_script_config
+#
+# Same shape as save_ha_automation_config — same dry_run-by-default
+# diff preview, same create-or-update-via-upsert behavior. For a NEW
+# script, script_id can be any valid slug you choose (it becomes the
+# script's object_id / the last part of its entity_id) — no timestamp
+# needed like automations, since scripts are identified by a meaningful
+# name rather than a generated id.
+# -----------------------------------------------------------------------
+@mcp.tool()
+def save_ha_script_config(script_id: str, config: str, dry_run: bool = True) -> str:
+    """Create or update a script. Applies live immediately — no reload needed.
+
+    script_id: for an EXISTING script, get this from list_ha_scripts.
+    For a NEW script, choose a slug-style id yourself (e.g.
+    "movie_mode") — it becomes the script's entity_id
+    (script.movie_mode). POSTing to an id that doesn't exist yet
+    creates it; no separate "create" call.
+
+    config: the COMPLETE script definition as a JSON string — alias,
+    sequence, fields, mode, etc. This replaces the whole script; always
+    fetch the current config with get_ha_script_config first if editing
+    an existing one.
+
+    dry_run controls whether this actually saves anything:
+      - True (default): fetch the current config (empty if this is a
+        new script) and return a diff against your proposed config,
+        WITHOUT saving. Always call with dry_run=True first.
+      - False: actually save. Home Assistant validates the script
+        structure server-side and rejects it with a clear error if
+        malformed. Applies LIVE immediately.
+    """
+    try:
+        proposed = json.loads(config)
+    except json.JSONDecodeError as e:
+        return f"Error: config is not valid JSON: {e}"
+
+    success, current = _ha_config_api("GET", "script", script_id)
+    current_text = json.dumps(current, indent=2, ensure_ascii=False) if success else ""
+
+    if dry_run:
+        proposed_text = json.dumps(proposed, indent=2, ensure_ascii=False)
+        diff_lines = list(
+            unified_diff(
+                current_text.splitlines(keepends=True),
+                proposed_text.splitlines(keepends=True),
+                fromfile=f"script '{script_id}' (current{'' if success else ', does not exist yet'})",
+                tofile=f"script '{script_id}' (proposed)",
+            )
+        )
+        if not diff_lines:
+            return "No changes: the proposed config is identical to the current one."
+        header = f"PREVIEW ONLY — nothing saved yet. Diff for script '{script_id}':\n\n"
+        return header + "".join(diff_lines)
+
+    success, result = _ha_config_api("POST", "script", script_id, json_body=proposed)
+    if not success:
+        return f"Error: Home Assistant rejected the save: {result}"
+
+    return f"Script '{script_id}' saved and applied live."
+
+
+# -----------------------------------------------------------------------
+# TOOL 22: remove_ha_script
+#
+# Same dry_run-gated preview-then-delete shape as remove_ha_automation.
+# -----------------------------------------------------------------------
+@mcp.tool()
+def remove_ha_script(script_id: str, dry_run: bool = True) -> str:
+    """Delete a script by its config id. No undo — always dry_run first.
+
+    script_id: from list_ha_scripts (the part of the entity_id after
+    "script.").
+
+    dry_run controls whether this actually deletes anything:
+      - True (default): fetch and return the script's current config so
+        you can confirm it's the right one, WITHOUT deleting.
+      - False: actually delete it. No automatic backup — save the
+        config with get_ha_script_config first if you might want it back.
+    """
+    success, current = _ha_config_api("GET", "script", script_id)
+    if not success:
+        return f"Error: {current}"
+
+    if dry_run:
+        current_text = json.dumps(current, indent=2, ensure_ascii=False)
+        return (
+            f"PREVIEW ONLY — nothing deleted yet. This script would be removed:\n\n"
+            f"{current_text}"
+        )
+
+    success, _ = _ha_config_api("DELETE", "script", script_id)
+    if not success:
+        return f"Error: Home Assistant rejected the delete."
+
+    return f"Script '{script_id}' deleted."
+
+
+# -----------------------------------------------------------------------
+# _fetch_traces / _fetch_trace_detail
+#
+# Traces are Home Assistant's step-by-step execution record for a single
+# automation or script run — which trigger fired, which conditions
+# passed/failed, what each action did, with timestamps and errors. This
+# answers a genuinely different question than get_ha_error_log: the log
+# tells you something went wrong somewhere; a trace tells you EXACTLY
+# what happened during one specific run of one specific automation.
+#
+# Only available over the WebSocket API ("trace/list" and "trace/get"
+# commands) — reuses _ha_ws_call, same as the dashboard tools.
+#
+# KNOWN GOTCHA, deliberately avoided here: trace/list returns traces in
+# CHRONOLOGICAL order (oldest first). A naive `traces[:limit]` therefore
+# returns the OLDEST runs, not the most recent ones — exactly backwards
+# from what "show me the last N runs" should mean. This is a real bug
+# that shipped in at least one other Home Assistant MCP server. Fixed
+# here by slicing from the end (`traces[-limit:]`) and reversing so the
+# most recent run is listed first.
+# -----------------------------------------------------------------------
+def _fetch_traces(domain: str, item_id: str, limit: int):
+    success, data = _ha_ws_call({"type": "trace/list", "domain": domain, "item_id": item_id})
+    if not success:
+        return False, data
+
+    # Oldest-first from HA — take the last `limit` (the most recent),
+    # then reverse so the newest run appears first in our output.
+    recent = data[-limit:] if limit else data
+    recent.reverse()
+    return True, recent
+
+
+def _fetch_trace_detail(domain: str, item_id: str, run_id: str):
+    return _ha_ws_call({"type": "trace/get", "domain": domain, "item_id": item_id, "run_id": run_id})
+
+
+def _format_trace_summary_line(trace: dict) -> str:
+    """One line per trace for list output: run_id, when, and outcome."""
+    run_id = trace.get("run_id", "unknown")
+    timestamp = trace.get("timestamp", {})
+    started = timestamp.get("start", "unknown time")
+    state = trace.get("state", "unknown")
+    script_execution = trace.get("script_execution")
+    outcome = f"state: {state}"
+    if script_execution:
+        outcome += f", result: {script_execution}"
+    if trace.get("error"):
+        outcome += f", ERROR: {trace['error']}"
+    return f"run_id: {run_id} | started: {started} | {outcome}"
+
+
+# -----------------------------------------------------------------------
+# TOOL 23: get_ha_automation_traces
+# -----------------------------------------------------------------------
+@mcp.tool()
+def get_ha_automation_traces(automation_id: str, limit: int = 5) -> str:
+    """Get recent execution traces for an automation — the most recent runs first.
+
+    automation_id: the config id (from list_ha_automations), not the
+    entity_id.
+
+    limit: how many of the MOST RECENT runs to return (default 5).
+
+    Each result line shows the run_id, when it started, and its outcome
+    (state, result, and any error). Use a run_id from this list with
+    get_ha_automation_trace_detail to see the full step-by-step record
+    of that specific run — which trigger fired, which conditions passed
+    or failed, and what each action did.
+
+    Use this to debug "why didn't my automation fire the way I
+    expected" — a genuinely different question than get_ha_error_log,
+    which only shows general system warnings/errors, not a per-run
+    execution history.
+    """
+    success, traces = _fetch_traces("automation", automation_id, limit)
+    if not success:
+        return f"Error: {traces}"
+
+    if not traces:
+        return f"No traces found for automation '{automation_id}' (it may not have run yet, or traces have expired)."
+
+    lines = [_format_trace_summary_line(t) for t in traces]
+    return f"Most recent {len(lines)} run(s) of automation '{automation_id}':\n\n" + "\n".join(lines)
+
+
+# -----------------------------------------------------------------------
+# TOOL 24: get_ha_automation_trace_detail
+# -----------------------------------------------------------------------
+@mcp.tool()
+def get_ha_automation_trace_detail(automation_id: str, run_id: str) -> str:
+    """Get the full step-by-step execution detail for one automation run.
+
+    automation_id: the config id. run_id: from get_ha_automation_traces'
+    output for the specific run you want to inspect.
+
+    Returns the complete trace as pretty-printed JSON — trigger data,
+    each condition's pass/fail result, each action's execution detail,
+    timing, and any errors. This is the deep-dive equivalent of clicking
+    a specific run in Home Assistant's own trace viewer.
+    """
+    success, data = _fetch_trace_detail("automation", automation_id, run_id)
+    if not success:
+        return f"Error: {data}"
+    return json.dumps(data, indent=2, ensure_ascii=False)
+
+
+# -----------------------------------------------------------------------
+# TOOL 25: get_ha_script_traces
+# TOOL 26: get_ha_script_trace_detail
+#
+# Scripts support traces too, same shape as automations — identical
+# tools, just pointed at the "script" domain instead.
+# -----------------------------------------------------------------------
+@mcp.tool()
+def get_ha_script_traces(script_id: str, limit: int = 5) -> str:
+    """Get recent execution traces for a script — the most recent runs first.
+
+    script_id: from list_ha_scripts (the part of the entity_id after
+    "script.").
+
+    limit: how many of the MOST RECENT runs to return (default 5).
+
+    Same shape as get_ha_automation_traces, applied to scripts instead.
+    Use a run_id from this list with get_ha_script_trace_detail to see
+    the full step-by-step record of that specific run.
+    """
+    success, traces = _fetch_traces("script", script_id, limit)
+    if not success:
+        return f"Error: {traces}"
+
+    if not traces:
+        return f"No traces found for script '{script_id}' (it may not have run yet, or traces have expired)."
+
+    lines = [_format_trace_summary_line(t) for t in traces]
+    return f"Most recent {len(lines)} run(s) of script '{script_id}':\n\n" + "\n".join(lines)
+
+
+@mcp.tool()
+def get_ha_script_trace_detail(script_id: str, run_id: str) -> str:
+    """Get the full step-by-step execution detail for one script run.
+
+    script_id: from list_ha_scripts. run_id: from get_ha_script_traces'
+    output for the specific run you want to inspect.
+
+    Returns the complete trace as pretty-printed JSON, same shape as
+    get_ha_automation_trace_detail.
+    """
+    success, data = _fetch_trace_detail("script", script_id, run_id)
+    if not success:
+        return f"Error: {data}"
+    return json.dumps(data, indent=2, ensure_ascii=False)
+
+
+# -----------------------------------------------------------------------
+# _node_red_login
+#
+# Node-RED's admin API auth is a resource-owner-password OAuth2-style
+# flow: POST username/password to /auth/token, get back a short-lived
+# access_token, use it as a Bearer header on subsequent calls. No
+# permanent token to cache here (unlike HA_TOKEN) — this runs fresh
+# every time a Node-RED tool is called, same "no persistent connection
+# between calls" philosophy as _ha_ws_call.
+# -----------------------------------------------------------------------
+def _node_red_login():
+    if not NODE_RED_URL or not NODE_RED_USERNAME or not NODE_RED_PASSWORD:
+        return False, "NODE_RED_URL, NODE_RED_USERNAME, or NODE_RED_PASSWORD is not configured in .env."
+
+    url = f"{NODE_RED_URL}/auth/token"
+    payload = {
+        "client_id": "node-red-editor",
+        "grant_type": "password",
+        "scope": "*",
+        "username": NODE_RED_USERNAME,
+        "password": NODE_RED_PASSWORD,
+    }
+
+    try:
+        response = requests.post(url, data=payload, timeout=15)
+    except (requests.exceptions.ConnectionError, requests.exceptions.Timeout):
+        return False, f"Could not reach Node-RED at {NODE_RED_URL}."
+
+    if response.status_code != 200:
+        return False, (
+            f"Node-RED login failed (status {response.status_code}). "
+            f"Check NODE_RED_USERNAME/NODE_RED_PASSWORD in .env are correct."
+        )
+
+    token = response.json().get("access_token")
+    if not token:
+        return False, "Node-RED login succeeded but no access_token was returned."
+
+    return True, token
+
+
+def _node_red_request(method: str, path: str, json_body=None, extra_headers: dict = None):
+    """Shared request helper: call one Node-RED admin API endpoint.
+
+    AUTH HISTORY (in case this needs revisiting): two earlier approaches
+    were tried and both failed with 401 — (1) Node-RED's own
+    username/password /auth/token OAuth-style login (_node_red_login
+    above, now unused), and (2) reusing HA_TOKEN as a Bearer header,
+    under the theory that this add-on proxies auth through Home
+    Assistant. Neither matched what the browser actually does: capturing
+    the real browser login in dev tools showed NO POST/fetch request at
+    all when logging in — consistent with the browser's NATIVE HTTP
+    Basic Auth prompt (handled at the protocol level, before any page
+    JavaScript runs, so it never shows as an XHR/fetch in the Network
+    tab). This sends the same NODE_RED_USERNAME/PASSWORD as standard
+    HTTP Basic Auth on every request instead — no separate login step,
+    since Basic Auth is sent with each individual request by design.
+    """
+    if not NODE_RED_URL or not NODE_RED_USERNAME or not NODE_RED_PASSWORD:
+        return False, "NODE_RED_URL, NODE_RED_USERNAME, or NODE_RED_PASSWORD is not configured in .env."
+
+    url = f"{NODE_RED_URL}{path}"
+    headers = {"Content-Type": "application/json"}
+    if extra_headers:
+        headers.update(extra_headers)
+
+    try:
+        response = requests.request(
+            method, url, headers=headers, json=json_body,
+            auth=(NODE_RED_USERNAME, NODE_RED_PASSWORD), timeout=30,
+        )
+    except (requests.exceptions.ConnectionError, requests.exceptions.Timeout):
+        return False, f"Could not reach Node-RED at {NODE_RED_URL}."
+
+    if response.status_code == 401 or response.status_code == 403:
+        return False, f"Node-RED rejected the request (status {response.status_code}). Check NODE_RED_USERNAME/NODE_RED_PASSWORD in .env."
+    if response.status_code not in (200, 204):
+        return False, f"Node-RED returned status {response.status_code}: {response.text}"
+
+    if response.status_code == 204 or not response.text:
+        return True, None
+
+    try:
+        return True, response.json()
+    except ValueError:
+        return False, f"Node-RED returned a non-JSON response: {response.text}"
+
+
+# -----------------------------------------------------------------------
+# TOOL 27: get_node_red_flows
+#
+# Node-RED's /flows endpoint returns the ENTIRE flow set as one big JSON
+# array — every tab, every node, everything. There's no per-flow fetch
+# in the base API. This is the read-only starting point before searching
+# or editing anything.
+# -----------------------------------------------------------------------
+@mcp.tool()
+def get_node_red_flows() -> str:
+    """Get the complete Node-RED flow configuration as JSON.
+
+    Returns every flow tab and every node, pretty-printed. This is the
+    full picture Node-RED itself works from — there's no way to fetch
+    just one flow through the base API. For finding something specific
+    (like a node referencing a particular entity_id or device name),
+    search_node_red_flows is usually more useful than reading this whole
+    thing by hand.
+    """
+    success, data = _node_red_request("GET", "/flows")
+    if not success:
+        return f"Error: {data}"
+    return json.dumps(data, indent=2, ensure_ascii=False)
+
+
+# -----------------------------------------------------------------------
+# TOOL 28: search_node_red_flows
+#
+# Reuses the exact same trick as search_entity_references: this is really
+# just a substring search, so it works for entity IDs, device names,
+# friendly names — anything appearing as text somewhere in a node's
+# JSON. Directly useful for the scenario that prompted building this:
+# finding every node that references an old/renamed device so nothing
+# gets missed after a rename.
+# -----------------------------------------------------------------------
+@mcp.tool()
+def search_node_red_flows(text: str, max_results: int = 50) -> str:
+    """Search all Node-RED flows for nodes containing specific text.
+
+    text is any substring to search for — an entity_id, a device name,
+    a friendly name, anything. This is a plain substring search across
+    every node's JSON representation (name, properties, everything), not
+    limited to a specific field.
+
+    Each result shows the node's id, type, name (if it has one), which
+    flow tab it's on, and a compact snippet of the node's JSON so you
+    can recognize it even without a name.
+
+    Use this before renaming a device or entity in Home Assistant to
+    find every Node-RED node that references the old name/id, so
+    nothing breaks silently — this was built specifically because a
+    device rename (AFTMM -> a new friendly name) broke a flow that was
+    hard to track down by hand.
+    """
+    success, data = _node_red_request("GET", "/flows")
+    if not success:
+        return f"Error: {data}"
+
+    # Build a quick tab-id -> tab-name lookup first, so results can show
+    # a human-readable flow name instead of just an opaque tab id.
+    tab_names = {
+        node["id"]: node.get("label", node["id"])
+        for node in data
+        if node.get("type") == "tab"
+    }
+
+    matches = []
+    for node in data:
+        node_json = json.dumps(node, ensure_ascii=False)
+        if text not in node_json:
+            continue
+
+        node_id = node.get("id", "unknown")
+        node_type = node.get("type", "unknown")
+        node_name = node.get("name") or "(unnamed)"
+        tab_id = node.get("z")
+        tab_name = tab_names.get(tab_id, tab_id or "(no tab / global)")
+
+        snippet = node_json
+        if len(snippet) > 200:
+            snippet = snippet[:200] + "..."
+
+        matches.append(
+            f"node id: {node_id} | type: {node_type} | name: {node_name} | "
+            f"tab: {tab_name} | contents: {snippet}"
+        )
+        if len(matches) >= max_results:
+            break
+
+    if not matches:
+        return f"No nodes found containing '{text}'."
+
+    header = f"Found {len(matches)} node(s) containing '{text}':\n\n"
+    footer = f"\n\n(Results capped at {max_results}; there may be more matches not shown.)" if len(matches) >= max_results else ""
+    return header + "\n".join(matches) + footer
+
+
+# -----------------------------------------------------------------------
+# TOOL 29: save_node_red_flows
+#
+# Same dry_run-by-default diff-preview philosophy as every other write
+# tool in this server. One structural difference from the HA tools:
+# Node-RED's full-deploy endpoint replaces EVERY flow at once — there's
+# no way to update just one node through the base admin API. So this
+# always operates on the complete flow set, same as get_node_red_flows
+# returns; fetch, modify the specific node(s) you care about, and pass
+# the WHOLE array back.
+#
+# The "Node-RED-Deployment-Type: full" header tells Node-RED to fully
+# stop and restart all flows with the new configuration (as opposed to
+# quicker partial-restart deploy modes) — the safest, most predictable
+# option for a change made outside the editor.
+# -----------------------------------------------------------------------
+@mcp.tool()
+def save_node_red_flows(flows_json: str, dry_run: bool = True) -> str:
+    """Save the complete Node-RED flow configuration. Applies live immediately.
+
+    flows_json: the COMPLETE flow array as a JSON string — every tab,
+    every node. This replaces everything at once; Node-RED's base API
+    has no way to update a single node in isolation. Always fetch the
+    current flows with get_node_red_flows first, make your specific
+    edit, and pass the complete modified array back here.
+
+    dry_run controls whether this actually deploys anything:
+      - True (default): fetch the current flows, diff them against your
+        proposed flows, and return that diff WITHOUT deploying. Always
+        call with dry_run=True first and check the diff only shows the
+        change you intended — since this replaces everything, a mistake
+        here could affect flows you didn't mean to touch.
+      - False: actually deploy. Applies LIVE immediately using a full
+        redeploy (all flows stop and restart with the new config) — the
+        safest, most predictable deploy mode for a change made outside
+        the Node-RED editor.
+    """
+    try:
+        proposed = json.loads(flows_json)
+    except json.JSONDecodeError as e:
+        return f"Error: flows_json is not valid JSON: {e}"
+
+    success, current = _node_red_request("GET", "/flows")
+    if not success:
+        return f"Error fetching current flows for diff: {current}"
+
+    if dry_run:
+        current_text = json.dumps(current, indent=2, ensure_ascii=False)
+        proposed_text = json.dumps(proposed, indent=2, ensure_ascii=False)
+        diff_lines = list(
+            unified_diff(
+                current_text.splitlines(keepends=True),
+                proposed_text.splitlines(keepends=True),
+                fromfile="Node-RED flows (current)",
+                tofile="Node-RED flows (proposed)",
+            )
+        )
+        if not diff_lines:
+            return "No changes: the proposed flows are identical to the current ones."
+        header = "PREVIEW ONLY — nothing deployed yet. Diff for Node-RED flows:\n\n"
+        return header + "".join(diff_lines)
+
+    success, result = _node_red_request(
+        "POST", "/flows", json_body=proposed, extra_headers={"Node-RED-Deployment-Type": "full"}
+    )
+    if not success:
+        return f"Error: Node-RED rejected the deploy: {result}"
+
+    return "Node-RED flows saved and deployed live."
 
 
 # -----------------------------------------------------------------------
