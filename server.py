@@ -2071,6 +2071,234 @@ def save_node_red_flows(flows_json: str, dry_run: bool = True) -> str:
 
 
 # -----------------------------------------------------------------------
+# TOOL 30: list_node_red_flows
+#
+# Node-RED's Admin API has no way to look up a flow by name/label —
+# only by id (a known, longstanding gap people have requested and never
+# gotten, confirmed via a Node-RED forum thread). This tool works
+# around that by fetching everything via get_node_red_flows and
+# filtering down to just the "type": "tab" entries — id + label pairs,
+# nothing else — so finding a tab's id by its name doesn't require
+# wading through the full multi-thousand-line flow dump. Use the id
+# this returns with get_node_red_flow / save_node_red_flow below.
+# -----------------------------------------------------------------------
+@mcp.tool()
+def list_node_red_flows() -> str:
+    """List every Node-RED flow (tab) by name, with its id.
+
+    Returns each tab's label and id — nothing else. Node-RED has no
+    built-in way to look up a flow by name, only by id, so use this
+    first to find the id for a flow you know by name (e.g. "Sleep
+    Bedroom TV"), then pass that id to get_node_red_flow or
+    save_node_red_flow.
+    """
+    success, data = _node_red_request("GET", "/flows")
+    if not success:
+        return f"Error: {data}"
+
+    tabs = [node for node in data if node.get("type") == "tab"]
+    if not tabs:
+        return "No flows found."
+
+    lines = [f"{tab.get('label', '(untitled)')}  (id: {tab['id']})" for tab in tabs]
+    return "\n".join(sorted(lines))
+
+
+# -----------------------------------------------------------------------
+# TOOL 31: get_node_red_flow
+# TOOL 32: save_node_red_flow
+#
+# The safer alternative to get_node_red_flows / save_node_red_flows:
+# Node-RED's Admin API has a SINGULAR /flow/:id endpoint (note: "flow",
+# not "flows") that operates on exactly ONE tab, not the whole system.
+# Per Node-RED's own docs, a PUT to /flow/:id stops only that flow's
+# nodes before starting the new version — every other tab keeps running
+# completely untouched.
+#
+# This matters a lot for risk: save_node_red_flows requires fetching,
+# diffing, and resending the ENTIRE flow set (every tab, every node)
+# just to change one thing — a much bigger blast radius if a mistake
+# slips through. These two tools scope every read and write to a single
+# tab instead, the same way search_entity_references / write_file are
+# scoped to one file rather than your whole HA config.
+#
+# Use list_node_red_flows (or search_node_red_flows) first to find the
+# tab id you want — then use these two for the actual edit.
+# -----------------------------------------------------------------------
+@mcp.tool()
+def get_node_red_flow(tab_id: str) -> str:
+    """Get ONE Node-RED flow (tab) by its id, not the whole flow set.
+
+    tab_id is a flow tab's id (from get_node_red_flows — look for
+    entries with "type": "tab" to find id/label pairs).
+
+    Returns just that tab's nodes as pretty-printed JSON — much smaller
+    and safer to work with than the full multi-tab result from
+    get_node_red_flows when you only care about one flow.
+    """
+    success, data = _node_red_request("GET", f"/flow/{tab_id}")
+    if not success:
+        return f"Error: {data}"
+    return json.dumps(data, indent=2, ensure_ascii=False)
+
+
+@mcp.tool()
+def save_node_red_flow(tab_id: str, flow_json: str, dry_run: bool = True) -> str:
+    """Save ONE Node-RED flow (tab) by its id. Applies live immediately.
+
+    tab_id: the flow tab's id (from get_node_red_flows or
+    get_node_red_flow).
+
+    flow_json: the COMPLETE configuration for THIS ONE TAB as a JSON
+    string — {"id": ..., "label": ..., "nodes": [...]}. This replaces
+    only this tab's nodes; every other tab in Node-RED is completely
+    unaffected, unlike save_node_red_flows which touches everything at
+    once. Always fetch the current tab with get_node_red_flow first,
+    make your specific edit, and pass the complete modified object back
+    here.
+
+    dry_run controls whether this actually saves anything:
+      - True (default): fetch the current tab, diff it against your
+        proposed version, and return that diff WITHOUT saving. Always
+        call with dry_run=True first.
+      - False: actually save. Node-RED stops only this tab's nodes,
+        applies the new configuration, and restarts them — every other
+        flow keeps running the whole time.
+    """
+    try:
+        proposed = json.loads(flow_json)
+    except json.JSONDecodeError as e:
+        return f"Error: flow_json is not valid JSON: {e}"
+
+    success, current = _node_red_request("GET", f"/flow/{tab_id}")
+    if not success:
+        return f"Error fetching current flow for diff: {current}"
+
+    if dry_run:
+        current_text = json.dumps(current, indent=2, ensure_ascii=False)
+        proposed_text = json.dumps(proposed, indent=2, ensure_ascii=False)
+        diff_lines = list(
+            unified_diff(
+                current_text.splitlines(keepends=True),
+                proposed_text.splitlines(keepends=True),
+                fromfile=f"flow '{tab_id}' (current)",
+                tofile=f"flow '{tab_id}' (proposed)",
+            )
+        )
+        if not diff_lines:
+            return "No changes: the proposed flow is identical to the current one."
+        header = f"PREVIEW ONLY — nothing saved yet. Diff for flow '{tab_id}':\n\n"
+        return header + "".join(diff_lines)
+
+    success, result = _node_red_request("PUT", f"/flow/{tab_id}", json_body=proposed)
+    if not success:
+        return f"Error: Node-RED rejected the save: {result}"
+
+    return f"Flow '{tab_id}' saved and applied live (other flows untouched)."
+
+
+# -----------------------------------------------------------------------
+# TOOL 33: create_node_red_flow
+#
+# save_node_red_flow (PUT /flow/:id) is for UPDATING an existing tab —
+# it always fetches the current version first, which would fail for a
+# tab that doesn't exist yet. Creating a genuinely NEW flow needs
+# Node-RED's separate POST /flow endpoint instead. One real quirk to
+# know: per Node-RED's own docs, POST /flow ALWAYS assigns a fresh id
+# itself — any id you might try to specify is discarded and replaced.
+# So there's no "choose your own id" option here, unlike automations/
+# scripts elsewhere in this server.
+#
+# No natural "diff" exists for something that doesn't exist yet, so
+# dry_run here just returns the proposed flow for review rather than a
+# unified_diff against nothing.
+# -----------------------------------------------------------------------
+@mcp.tool()
+def create_node_red_flow(label: str, nodes_json: str, dry_run: bool = True) -> str:
+    """Create a brand-new Node-RED flow (tab). Applies live immediately.
+
+    label: the new tab's display name.
+
+    nodes_json: a JSON array of node objects for this new tab (the
+    "nodes" list only — not wrapped in {"id":..., "nodes":...}). Each
+    node needs at minimum a unique "id" and "type". Node-RED will assign
+    the TAB's own id itself; any tab-level id you might include is
+    discarded, per Node-RED's own API behavior.
+
+    dry_run controls whether this actually creates anything:
+      - True (default): return the proposed flow (label + nodes) for
+        review WITHOUT creating it. There's nothing existing to diff
+        against, so this just echoes back what would be sent.
+      - False: actually create it. Applies live immediately. Returns
+        the new tab's id — save it if you'll need to edit this flow
+        again with get_node_red_flow/save_node_red_flow.
+    """
+    try:
+        nodes = json.loads(nodes_json)
+    except json.JSONDecodeError as e:
+        return f"Error: nodes_json is not valid JSON: {e}"
+
+    if not isinstance(nodes, list):
+        return "Error: nodes_json must be a JSON array of node objects."
+
+    proposed = {"label": label, "nodes": nodes}
+
+    if dry_run:
+        return (
+            f"PREVIEW ONLY — nothing created yet. This flow would be created:\n\n"
+            f"{json.dumps(proposed, indent=2, ensure_ascii=False)}"
+        )
+
+    success, result = _node_red_request("POST", "/flow", json_body=proposed)
+    if not success:
+        return f"Error: Node-RED rejected the create: {result}"
+
+    new_id = result.get("id") if isinstance(result, dict) else result
+    return f"Flow '{label}' created and applied live. New tab id: {new_id}"
+
+
+# -----------------------------------------------------------------------
+# TOOL 34: remove_node_red_flow
+#
+# Same dry_run-gated preview-then-delete shape as remove_ha_automation.
+# No automatic backup exists for this either — the dry_run preview
+# (echoing back the full flow that would be deleted) is the only safety
+# net, so treat it as mandatory in practice. If you might want the flow
+# back later, get_node_red_flow first and save the JSON somewhere before
+# deleting.
+# -----------------------------------------------------------------------
+@mcp.tool()
+def remove_node_red_flow(tab_id: str, dry_run: bool = True) -> str:
+    """Delete a Node-RED flow (tab) by its id. No undo — always dry_run first.
+
+    tab_id: from list_node_red_flows or get_node_red_flows.
+
+    dry_run controls whether this actually deletes anything:
+      - True (default): fetch and return the flow's current nodes so
+        you can confirm it's the right one, WITHOUT deleting.
+      - False: actually delete it. There is no automatic backup — use
+        get_node_red_flow to save the JSON first if you might want the
+        flow back later.
+    """
+    success, current = _node_red_request("GET", f"/flow/{tab_id}")
+    if not success:
+        return f"Error: {current}"
+
+    if dry_run:
+        current_text = json.dumps(current, indent=2, ensure_ascii=False)
+        return (
+            f"PREVIEW ONLY — nothing deleted yet. This flow would be removed:\n\n"
+            f"{current_text}"
+        )
+
+    success, _ = _node_red_request("DELETE", f"/flow/{tab_id}")
+    if not success:
+        return f"Error: Node-RED rejected the delete."
+
+    return f"Flow '{tab_id}' deleted."
+
+
+# -----------------------------------------------------------------------
 # RESOURCE 1: ha://entities
 #
 # This is the first RESOURCE in this server, not a tool — an important
