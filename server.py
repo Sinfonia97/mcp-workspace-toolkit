@@ -1871,12 +1871,24 @@ def _node_red_request(method: str, path: str, json_body=None, extra_headers: dic
     tab). This sends the same NODE_RED_USERNAME/PASSWORD as standard
     HTTP Basic Auth on every request instead — no separate login step,
     since Basic Auth is sent with each individual request by design.
+
+    CONTENT-NEGOTIATION GOTCHA (found while debugging list_node_red_nodes):
+    some Node-RED Admin API endpoints — confirmed for /nodes — are
+    DUAL-PURPOSE: the browser editor calls the same URL to fetch raw
+    .html node-definition templates (to build the palette UI), and that
+    HTML response is the DEFAULT unless the request explicitly asks for
+    JSON. Without an "Accept: application/json" header, GET /nodes
+    returned ~1.86MB of concatenated HTML instead of the expected JSON
+    module list — which then failed JSON parsing and got embedded
+    whole into an error message, masquerading as a "result too large"
+    error with no obvious cause. Sending this header on every request
+    avoids the whole class of bug, not just this one instance of it.
     """
     if not NODE_RED_URL or not NODE_RED_USERNAME or not NODE_RED_PASSWORD:
         return False, "NODE_RED_URL, NODE_RED_USERNAME, or NODE_RED_PASSWORD is not configured in .env."
 
     url = f"{NODE_RED_URL}{path}"
-    headers = {"Content-Type": "application/json"}
+    headers = {"Content-Type": "application/json", "Accept": "application/json"}
     if extra_headers:
         headers.update(extra_headers)
 
@@ -2296,6 +2308,226 @@ def remove_node_red_flow(tab_id: str, dry_run: bool = True) -> str:
         return f"Error: Node-RED rejected the delete."
 
     return f"Flow '{tab_id}' deleted."
+
+
+# -----------------------------------------------------------------------
+# TOOL 35: list_node_red_nodes
+#
+# Lists installed node modules with name, version, enabled state, and a
+# node-type count. Two real bugs got fixed here, in sequence:
+#   1. GET /nodes defaulted to returning ~1.86MB of raw HTML (the
+#      editor's palette templates) instead of JSON, unless the request
+#      sent "Accept: application/json" — now fixed in _node_red_request
+#      above, shared by every Node-RED tool.
+#   2. Once that was fixed, the REAL response shape turned out to differ
+#      from what the POST /nodes (single-install) docs example implied.
+#      GET /nodes (list-all) returns a FLAT array where each entry is
+#      already one individual node "set" (e.g. "inject", "debug",
+#      "switch" each as their own entry) with "enabled" and "types"
+#      directly on it — not grouped under a nested "nodes" list the way
+#      a single-module install response is. Confirmed by seeing real
+#      output: every row showed "enabled: ?" and "0 node type(s)"
+#      because the code was looking one level too deep.
+# -----------------------------------------------------------------------
+@mcp.tool()
+def list_node_red_nodes() -> str:
+    """List all installed node sets with their type name, module, version, and enabled state.
+
+    Each Node-RED "node set" is roughly one node type (e.g. "inject",
+    "debug", "switch") — several sets are often provided by the same
+    underlying npm module (shown as "module:"). Use this before
+    designing a new flow to confirm a node type is installed, or before
+    install_node_red_node to check if a module is already there. For
+    the complete raw detail of one entry, use
+    get_node_red_node_info(module) with its module name.
+    """
+    success, data = _node_red_request("GET", "/nodes")
+    if not success:
+        return f"Error: {data}"
+
+    if not data or not isinstance(data, list):
+        return "No node modules found."
+
+    lines = []
+    for entry in data:
+        if not isinstance(entry, dict):
+            continue
+        name = entry.get("name", "unknown")
+        module = entry.get("module", name)
+        version = entry.get("version", "?")
+        enabled = entry.get("enabled", "?")
+        types = entry.get("types", [])
+        type_desc = ", ".join(types) if types else "(no types listed)"
+        lines.append(f"{name} (module: {module}, v{version}, enabled: {enabled}) — {type_desc}")
+    return "\n".join(sorted(lines))
+
+
+# -----------------------------------------------------------------------
+# TOOL 35b: get_node_red_node_info
+#
+# The companion to list_node_red_nodes' condensed output: that tool only
+# shows a TYPE COUNT per module (to stay under the response size limit),
+# not the individual type names. This drills into ONE module to see its
+# full type list and detail — safe to return in full since it's scoped
+# to a single module, not all of them at once.
+# -----------------------------------------------------------------------
+@mcp.tool()
+def get_node_red_node_info(module: str) -> str:
+    """Get a node module's full information, including every type it provides.
+
+    module: the module name (from list_node_red_nodes).
+
+    Returns the complete detail for just this one module as pretty-
+    printed JSON, including every individual node type name — safe to
+    return in full since it's scoped to one module, unlike
+    list_node_red_nodes' condensed summary of everything at once.
+    """
+    success, data = _node_red_request("GET", f"/nodes/{module}")
+    if not success:
+        return f"Error: {data}"
+    return json.dumps(data, indent=2, ensure_ascii=False)
+
+
+# -----------------------------------------------------------------------
+# TOOL 36: install_node_red_node
+#
+# Genuinely different in kind from every other write tool in this server:
+# this triggers a real `npm install` on the Node-RED host, downloading
+# and running third-party code — not just a config change. There's
+# nothing meaningful to "diff" against (nothing existed before), so
+# dry_run here just confirms the module name back to you before
+# committing to an actual install, which can take a while and may fail
+# for reasons outside this server's control (network, bad package name,
+# incompatible Node-RED version).
+# -----------------------------------------------------------------------
+@mcp.tool()
+def install_node_red_node(module: str, dry_run: bool = True) -> str:
+    """Install a new node module from npm into Node-RED. Applies live.
+
+    module: the npm package name, e.g. "node-red-node-suncalc" (check
+    flows.nodered.org or npm directly for the exact name first).
+
+    dry_run controls whether this actually installs anything:
+      - True (default): just confirm the module name back to you
+        WITHOUT installing. There's nothing to diff against for a new
+        install, so this is mainly a chance to catch a typo'd package
+        name before it runs.
+      - False: actually install. This runs a real npm install on the
+        Node-RED host — can take anywhere from seconds to a couple of
+        minutes, and can fail for reasons outside this server's control
+        (bad package name, network issue, version incompatibility).
+    """
+    if dry_run:
+        return f"PREVIEW ONLY — nothing installed yet. Would install npm module '{module}' into Node-RED."
+
+    success, result = _node_red_request("POST", "/nodes", json_body={"module": module})
+    if not success:
+        return f"Error: Node-RED rejected the install: {result}"
+
+    return f"Installed '{module}'. Result: {json.dumps(result, ensure_ascii=False)}"
+
+
+# -----------------------------------------------------------------------
+# TOOL 37: set_node_red_node_enabled
+# -----------------------------------------------------------------------
+@mcp.tool()
+def set_node_red_node_enabled(module: str, enabled: bool, dry_run: bool = True) -> str:
+    """Enable or disable an installed node module (without uninstalling it).
+
+    module: the module name (from list_node_red_nodes).
+    enabled: True to enable, False to disable.
+
+    dry_run controls whether this actually changes anything:
+      - True (default): confirm what would change WITHOUT applying it.
+      - False: actually apply it. Disabled node types stop appearing in
+        the palette and any flow already using them will fail to
+        deploy/start until re-enabled.
+    """
+    if dry_run:
+        action = "enable" if enabled else "disable"
+        return f"PREVIEW ONLY — nothing changed yet. Would {action} module '{module}'."
+
+    success, result = _node_red_request("PUT", f"/nodes/{module}", json_body={"enabled": enabled})
+    if not success:
+        return f"Error: Node-RED rejected the change: {result}"
+
+    return f"Module '{module}' {'enabled' if enabled else 'disabled'}."
+
+
+# -----------------------------------------------------------------------
+# TOOL 38: remove_node_red_node
+#
+# Uninstalls a module entirely (removes the npm package) — a step
+# further than disabling. Same dry_run-gated preview pattern as every
+# other delete tool in this server.
+# -----------------------------------------------------------------------
+@mcp.tool()
+def remove_node_red_node(module: str, dry_run: bool = True) -> str:
+    """Uninstall a node module from Node-RED entirely. No undo — always dry_run first.
+
+    module: the module name (from list_node_red_nodes).
+
+    dry_run controls whether this actually removes anything:
+      - True (default): confirm which module would be removed WITHOUT
+        removing it.
+      - False: actually uninstall it. Any flow using a node type from
+        this module will fail to deploy/start afterward.
+    """
+    if dry_run:
+        return f"PREVIEW ONLY — nothing removed yet. Would uninstall module '{module}'."
+
+    success, _ = _node_red_request("DELETE", f"/nodes/{module}")
+    if not success:
+        return f"Error: Node-RED rejected the removal."
+
+    return f"Module '{module}' uninstalled."
+
+
+# -----------------------------------------------------------------------
+# TOOL 39: get_node_red_diagnostics
+# -----------------------------------------------------------------------
+@mcp.tool()
+def get_node_red_diagnostics() -> str:
+    """Get Node-RED's own runtime diagnostics report (versions, platform, stats).
+
+    Returns Node-RED's built-in health/diagnostic snapshot as
+    pretty-printed JSON — a deeper equivalent of get_server_status,
+    specific to Node-RED itself rather than this MCP server.
+    """
+    success, data = _node_red_request("GET", "/diagnostics")
+    if not success:
+        return f"Error: {data}"
+    return json.dumps(data, indent=2, ensure_ascii=False)
+
+
+# -----------------------------------------------------------------------
+# TOOL 40: get_node_red_settings
+#
+# Not a feature tool — a sanity-check tool. Everything else in this
+# section assumes a particular Node-RED version, a particular API base
+# path, and a "flows.json"-style storage model (not the optional
+# git-backed "Projects" mode, which changes how flows persist). This
+# reads Node-RED's own reported runtime settings so those assumptions
+# can be verified rather than discovered the hard way — the same
+# instinct that led to catching the /context dead-end before building
+# against it.
+# -----------------------------------------------------------------------
+@mcp.tool()
+def get_node_red_settings() -> str:
+    """Get Node-RED's runtime settings (version, editor theme, safe config subset).
+
+    Returns Node-RED's own reported settings as pretty-printed JSON —
+    NOT your actual settings.js file or credentials, just the safe
+    subset the Admin API exposes (version number, enabled features,
+    editor configuration, etc.). Useful for confirming assumptions the
+    other Node-RED tools in this server depend on: which version is
+    running, whether Projects mode is enabled (changes how flows are
+    stored), and the API's actual base path.
+    """
+    success, data = _node_red_request("GET", "/settings")
+    if not success:
+        return f"Error: {data}"
+    return json.dumps(data, indent=2, ensure_ascii=False)
 
 
 # -----------------------------------------------------------------------
