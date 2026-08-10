@@ -27,11 +27,14 @@ stdin/stdout. See README.md for how to wire it up.
 import json
 import os
 from difflib import unified_diff
+from io import StringIO
 from pathlib import Path
 
 import requests
 from dotenv import load_dotenv
 from mcp.server import MCPServer
+from ruamel.yaml import YAML
+from ruamel.yaml.comments import CommentedMap, CommentedSeq, TaggedScalar
 
 # Load HA_URL and HA_TOKEN from the .env file in this folder into the
 # process environment. .env is gitignored — this is what keeps the token
@@ -2528,6 +2531,503 @@ def get_node_red_settings() -> str:
     if not success:
         return f"Error: {data}"
     return json.dumps(data, indent=2, ensure_ascii=False)
+
+
+# =========================================================================
+# YAML SINGLE-ENTITY EDITING (get/edit/add/remove_yaml_entity)
+#
+# Everything above that touches YAML (read_file, write_file) treats it as
+# plain text — fine for whole-file operations, but risky for changing ONE
+# entity buried inside a file structured as multiple "- sensor:" /
+# "- binary_sensor:" blocks, each containing a LIST of named entities
+# (exactly how templates/sensor/*.yaml is organized). A whole-file
+# overwrite works, but the diff and the risk cover the entire file, not
+# just the one thing you meant to change.
+#
+# These four tools operate at ENTITY granularity instead: locate one
+# entity by its "name" field, and edit/add/remove ONLY that entity's
+# lines — everything else in the file, including comments and formatting,
+# stays byte-for-byte untouched.
+#
+# BUILT AFTER SUBSTANTIAL PROTOTYPING (in a separate sandbox, not this
+# file) that found and fixed three real bugs before any of this touched
+# a real file:
+#   1. ruamel.yaml's TaggedScalar constructor signature is actually
+#      (value, style, tag) — passing tag as the 2nd positional argument
+#      silently sets STYLE instead, which broke custom Home Assistant
+#      YAML tags (!include, !secret, etc.) entirely, dumping them as
+#      "!<None>". Must construct with tag=... by keyword.
+#   2. A first boundary-detection approach ("this entity ends where the
+#      next entity starts") SILENTLY DELETED domain-block headers and
+#      comments whenever they sat between two entities from different
+#      blocks (e.g. between the last item under "- sensor:" and the
+#      following "- binary_sensor:"). Fixed by scanning forward using
+#      actual line INDENTATION instead of assuming entity adjacency —
+#      an entity's content ends at the first line whose indentation
+#      drops to at or below its own starting indent.
+#   3. Ruamel's round-trip mode attaches "a blank line follows this
+#      node" as metadata on parsed nodes, so it can reproduce spacing on
+#      re-dump — which caused a DOUBLED blank line: the entity object
+#      (from the full original document) remembered it was followed by
+#      a blank line, so re-rendering it reproduced that blank line IN
+#      ADDITION to the original one already being preserved separately
+#      via the untouched raw-text splice. Fixed by stripping trailing
+#      blank lines from every rendered replacement before splicing.
+#
+# The core technique: use ruamel ONLY to semantically LOCATE an entity
+# (via its .lc line/column tracking) and to RENDER a replacement's own
+# small snippet — never to re-serialize the whole document. The original
+# file's raw text is spliced around that snippet, so nothing else in the
+# file is ever regenerated or reflowed.
+# =========================================================================
+
+_entity_yaml = YAML(typ="rt")  # round-trip: preserves comments/formatting
+_entity_yaml.preserve_quotes = True
+_entity_yaml.width = 4096  # avoid re-wrapping long lines differently than the source
+
+
+def _ha_tag_constructor(constructor, tag_suffix, node):
+    """Treat any unrecognized "!xxx" tag (!include, !secret, etc. — Home
+    Assistant's custom YAML directives) as an opaque value that survives
+    round-tripping unchanged, rather than raising a parse error."""
+    return TaggedScalar(value=constructor.construct_scalar(node), tag="!" + tag_suffix)
+
+
+_entity_yaml.constructor.add_multi_constructor("!", _ha_tag_constructor)
+
+
+def _ha_tagged_scalar_representer(representer, data):
+    return representer.represent_scalar(data.tag.value, data.value)
+
+
+_entity_yaml.representer.add_representer(TaggedScalar, _ha_tagged_scalar_representer)
+
+
+def _find_yaml_entity(data, target_name: str):
+    """Walk the top-level list-of-domain-blocks structure (e.g.
+    "- sensor: [...]", "- binary_sensor: [...]") and find the entity
+    dict whose "name" field matches target_name, searching every
+    domain's list. Returns (entity, entity_list, index, domain_key) or
+    None if not found anywhere in the file."""
+    if not isinstance(data, CommentedSeq):
+        return None
+    for block in data:
+        if not isinstance(block, CommentedMap):
+            continue
+        for domain_key, entity_list in block.items():
+            if not isinstance(entity_list, CommentedSeq):
+                continue
+            for i, entity in enumerate(entity_list):
+                if isinstance(entity, CommentedMap) and entity.get("name") == target_name:
+                    return entity, entity_list, i, domain_key
+    return None
+
+
+def _find_yaml_domain_block(data, domain: str):
+    """Find the (block, entity_list) for a top-level domain key (e.g.
+    "sensor", "binary_sensor"). Returns None if that domain has no
+    block anywhere in the file yet."""
+    if not isinstance(data, CommentedSeq):
+        return None
+    for block in data:
+        if isinstance(block, CommentedMap) and domain in block:
+            entity_list = block[domain]
+            if isinstance(entity_list, CommentedSeq):
+                return block, entity_list
+    return None
+
+
+def _get_yaml_entity_bounds(entity, original_lines):
+    """Find the [start, end) line range (0-indexed) this entity occupies
+    in the ORIGINAL raw source text, by scanning forward from its start
+    line using indentation depth — NOT by assuming the next entity in
+    the list starts immediately after (that approach silently deleted
+    domain-block headers/comments sitting between entities from
+    different blocks; see the module docstring above).
+
+    An entity's own indent is its "- " dash column (entity.lc.col is the
+    column of "name:", which is always 2 past the dash in every real
+    file this was tested against). Content belongs to this entity as
+    long as each subsequent non-blank line is indented MORE than that;
+    the first line at or below that indent — a sibling entity, a new
+    domain block, or EOF — marks the end. Trailing blank lines are
+    trimmed back off the range, since they belong to the gap BEFORE
+    whatever follows, not to this entity's own content.
+    """
+    entity_dash_col = entity.lc.col - 2
+    start = entity.lc.line
+    end = start + 1
+    total = len(original_lines)
+    while end < total:
+        line = original_lines[end]
+        if not line.strip():
+            end += 1
+            continue
+        line_indent = len(line) - len(line.lstrip(" "))
+        if line_indent <= entity_dash_col:
+            break
+        end += 1
+    while end > start + 1 and not original_lines[end - 1].strip():
+        end -= 1
+    return start, end
+
+
+def _render_yaml_entity(entity, indent_spaces: int) -> str:
+    """Dump one entity dict as "- key: value" YAML text, indented to
+    match its target position, with exactly one trailing newline and NO
+    trailing blank line (see bug #3 in the module docstring above for
+    why that stripping is necessary)."""
+    buf = StringIO()
+    wrapper = CommentedSeq([entity])
+    _entity_yaml.dump(wrapper, buf)
+    rendered = buf.getvalue().rstrip("\n") + "\n"
+    prefix = " " * indent_spaces
+    return "".join(prefix + line if line.strip() else line for line in rendered.splitlines(keepends=True))
+
+
+def _parse_yaml_entity_input(entity_yaml: str):
+    """Parse a user-supplied entity definition (a single YAML mapping,
+    e.g. "name: ...\\nstate: ...\\n") into a CommentedMap. Returns
+    (entity_or_None, error_message_or_None)."""
+    try:
+        # Wrap as a single-item list so ruamel parses it with the same
+        # machinery used everywhere else here, and to sanity-check it's
+        # a plain mapping (a dict), not a list or scalar.
+        parsed = _entity_yaml.load("- " + entity_yaml.replace("\n", "\n  "))
+    except Exception as e:
+        return None, f"Error: entity_yaml is not valid YAML: {e}"
+    if not parsed or not isinstance(parsed[0], CommentedMap):
+        return None, "Error: entity_yaml must be a YAML mapping (key: value pairs), not a list or scalar."
+    return parsed[0], None
+
+
+# -----------------------------------------------------------------------
+# TOOL 41: get_yaml_entity
+# -----------------------------------------------------------------------
+@mcp.tool()
+def get_yaml_entity(path: str, entity_name: str) -> str:
+    """Get one named entity's exact current YAML text from a template-style file.
+
+    path is relative to the allowed base directory, e.g.
+    "templates/sensor/status_sensors.yaml". entity_name is that
+    entity's "name" field, e.g. "Number Of Motion Detected".
+
+    Returns the EXACT current lines for just that one entity (not a
+    re-serialized version) — comments, formatting, everything as it
+    really appears in the file. Use this before edit_yaml_entity to see
+    what you're about to change.
+
+    Only works on files structured as Home Assistant expects for
+    templates: a top-level list of domain blocks (e.g. "- sensor:",
+    "- binary_sensor:"), each containing a list of named entities.
+    """
+    try:
+        safe_path = _resolve_safe_path(path)
+    except ValueError as e:
+        return str(e)
+
+    if not safe_path.exists() or not safe_path.is_file():
+        return f"Error: '{path}' does not exist or is not a file."
+
+    try:
+        text = safe_path.read_text(encoding="utf-8")
+    except UnicodeDecodeError:
+        return f"Error: '{path}' could not be read as UTF-8 text."
+
+    try:
+        data = _entity_yaml.load(text)
+    except Exception as e:
+        return f"Error: '{path}' could not be parsed as YAML: {e}"
+
+    found = _find_yaml_entity(data, entity_name)
+    if not found:
+        return f"Error: no entity named '{entity_name}' found in '{path}'."
+
+    entity, entity_list, idx, domain_key = found
+    original_lines = text.splitlines(keepends=True)
+    start, end = _get_yaml_entity_bounds(entity, original_lines)
+
+    return (
+        f"Entity '{entity_name}' (domain: {domain_key}) in '{path}', "
+        f"source lines {start + 1}-{end}:\n\n" + "".join(original_lines[start:end])
+    )
+
+
+# -----------------------------------------------------------------------
+# TOOL 42: edit_yaml_entity
+#
+# Whole-entity replacement (same philosophy as write_file's "overwrite"
+# mode, applied at entity granularity instead of file granularity) —
+# not a partial field patch. Pass the COMPLETE new definition for the
+# entity, not just the fields that changed.
+# -----------------------------------------------------------------------
+@mcp.tool()
+def edit_yaml_entity(path: str, entity_name: str, entity_yaml: str, dry_run: bool = True) -> str:
+    """Replace one named entity's content in a template-style file, leaving everything else untouched.
+
+    path: relative to the allowed base directory, e.g.
+    "templates/sensor/status_sensors.yaml".
+
+    entity_name: the entity's CURRENT "name" field, used to find it.
+
+    entity_yaml: the COMPLETE new definition for this entity as a YAML
+    mapping (all fields, not just the ones changing) — e.g.
+    "name: \\"Number Of Motion Detected\\"\\nstate: \\"...\\"\\n...".
+    This replaces the entity's entire block; if you're changing one
+    field, include every other field unchanged alongside it (use
+    get_yaml_entity first to see the current full definition).
+
+    dry_run controls whether this actually writes anything:
+      - True (default): return a diff of the WHOLE FILE showing exactly
+        what would change — which, for a correct edit, should only be
+        the lines belonging to this one entity. Always call with
+        dry_run=True first and confirm the diff touches nothing else.
+      - False: actually write. Backs up the original file to
+        "<name>.bak" first (same one-time-per-session pattern as
+        write_file), same automatic safety net.
+    """
+    try:
+        safe_path = _resolve_safe_path(path)
+    except ValueError as e:
+        return str(e)
+
+    if not safe_path.exists() or not safe_path.is_file():
+        return f"Error: '{path}' does not exist or is not a file."
+
+    try:
+        original_text = safe_path.read_text(encoding="utf-8")
+    except UnicodeDecodeError:
+        return f"Error: '{path}' could not be read as UTF-8 text."
+
+    try:
+        data = _entity_yaml.load(original_text)
+    except Exception as e:
+        return f"Error: '{path}' could not be parsed as YAML: {e}"
+
+    found = _find_yaml_entity(data, entity_name)
+    if not found:
+        return f"Error: no entity named '{entity_name}' found in '{path}'."
+
+    entity, entity_list, idx, domain_key = found
+    new_entity, parse_error = _parse_yaml_entity_input(entity_yaml)
+    if parse_error:
+        return parse_error
+
+    original_lines = original_text.splitlines(keepends=True)
+    start, end = _get_yaml_entity_bounds(entity, original_lines)
+    indent_spaces = entity.lc.col - 2
+
+    new_lines = _render_yaml_entity(new_entity, indent_spaces).splitlines(keepends=True)
+    result_lines = original_lines[:start] + new_lines + original_lines[end:]
+    new_text = "".join(result_lines)
+
+    if dry_run:
+        diff_lines = list(
+            unified_diff(
+                original_lines, result_lines,
+                fromfile=f"{path} (current)", tofile=f"{path} (proposed)",
+            )
+        )
+        if not diff_lines:
+            return f"No changes: the proposed content for '{entity_name}' is identical to what's already there."
+        header = f"PREVIEW ONLY — nothing written yet. Diff for '{path}' (entity '{entity_name}'):\n\n"
+        return header + "".join(diff_lines)
+
+    backup_path = safe_path.with_suffix(safe_path.suffix + ".bak")
+    backup_note = ""
+    if not backup_path.exists():
+        backup_path.write_bytes(safe_path.read_bytes())
+        backup_note = f" (original backed up to '{backup_path.name}')"
+
+    try:
+        safe_path.write_text(new_text, encoding="utf-8")
+    except OSError as e:
+        return f"Error writing '{path}': {e}"
+
+    return f"Updated entity '{entity_name}' in '{path}'.{backup_note}"
+
+
+# -----------------------------------------------------------------------
+# TOOL 43: add_yaml_entity
+#
+# Inserts a NEW entity into an existing domain block's list, as the last
+# item — leaving every other entity, comment, and domain block in the
+# file completely untouched. If the target domain block doesn't exist
+# yet anywhere in the file, a new one is appended at the end instead.
+# -----------------------------------------------------------------------
+@mcp.tool()
+def add_yaml_entity(path: str, domain: str, entity_yaml: str, dry_run: bool = True) -> str:
+    """Add a new entity to a template-style file, as the last item under a domain block.
+
+    path: relative to the allowed base directory.
+
+    domain: which block to add to, e.g. "sensor" or "binary_sensor". If
+    a "- {domain}:" block already exists in the file, the new entity is
+    appended as its last item. If no such block exists yet, a brand-new
+    one is added at the end of the file.
+
+    entity_yaml: the new entity's COMPLETE definition as a YAML mapping,
+    e.g. "name: \\"My New Sensor\\"\\nstate: \\"...\\"\\n...".
+
+    dry_run controls whether this actually writes anything:
+      - True (default): return a diff of the whole file showing exactly
+        what would be added, WITHOUT writing.
+      - False: actually write, with the same automatic .bak backup as
+        edit_yaml_entity/write_file.
+    """
+    try:
+        safe_path = _resolve_safe_path(path)
+    except ValueError as e:
+        return str(e)
+
+    if not safe_path.exists() or not safe_path.is_file():
+        return f"Error: '{path}' does not exist or is not a file."
+
+    try:
+        original_text = safe_path.read_text(encoding="utf-8")
+    except UnicodeDecodeError:
+        return f"Error: '{path}' could not be read as UTF-8 text."
+
+    try:
+        data = _entity_yaml.load(original_text)
+    except Exception as e:
+        return f"Error: '{path}' could not be parsed as YAML: {e}"
+
+    new_entity, parse_error = _parse_yaml_entity_input(entity_yaml)
+    if parse_error:
+        return parse_error
+
+    entity_name = new_entity.get("name")
+    if entity_name and _find_yaml_entity(data, entity_name):
+        return (
+            f"Error: an entity named '{entity_name}' already exists in '{path}'. "
+            f"Use edit_yaml_entity to change it instead."
+        )
+
+    original_lines = original_text.splitlines(keepends=True)
+    block_result = _find_yaml_domain_block(data, domain)
+
+    if block_result and len(block_result[1]) > 0:
+        # Domain block exists and has at least one entity — insert after
+        # the LAST entity's own content, matching its indentation.
+        entity_list = block_result[1]
+        last_entity = entity_list[-1]
+        indent_spaces = last_entity.lc.col - 2
+        _, insert_at = _get_yaml_entity_bounds(last_entity, original_lines)
+        new_lines = _render_yaml_entity(new_entity, indent_spaces).splitlines(keepends=True)
+        result_lines = original_lines[:insert_at] + new_lines + original_lines[insert_at:]
+    elif block_result:
+        # Domain block exists but is empty — insert right after its key line.
+        block, entity_list = block_result
+        indent_spaces = 4  # matches every real file this was built against
+        key_line = block.lc.data[domain][0]
+        insert_at = key_line + 1
+        new_lines = _render_yaml_entity(new_entity, indent_spaces).splitlines(keepends=True)
+        result_lines = original_lines[:insert_at] + new_lines + original_lines[insert_at:]
+    else:
+        # No block for this domain anywhere — append a brand-new one at
+        # the end of the file, matching the standard top-level shape.
+        indent_spaces = 4
+        rendered_entity = _render_yaml_entity(new_entity, indent_spaces)
+        new_block_text = f"\n- {domain}:\n{rendered_entity}"
+        if original_lines and not original_lines[-1].endswith("\n"):
+            new_block_text = "\n" + new_block_text
+        result_lines = original_lines + new_block_text.splitlines(keepends=True)
+
+    new_text = "".join(result_lines)
+
+    if dry_run:
+        diff_lines = list(
+            unified_diff(
+                original_lines, result_lines,
+                fromfile=f"{path} (current)", tofile=f"{path} (proposed)",
+            )
+        )
+        header = f"PREVIEW ONLY — nothing written yet. Diff for '{path}' (adding to '{domain}'):\n\n"
+        return header + "".join(diff_lines)
+
+    backup_path = safe_path.with_suffix(safe_path.suffix + ".bak")
+    backup_note = ""
+    if not backup_path.exists():
+        backup_path.write_bytes(safe_path.read_bytes())
+        backup_note = f" (original backed up to '{backup_path.name}')"
+
+    try:
+        safe_path.write_text(new_text, encoding="utf-8")
+    except OSError as e:
+        return f"Error writing '{path}': {e}"
+
+    return f"Added new entity to '{domain}' in '{path}'.{backup_note}"
+
+
+# -----------------------------------------------------------------------
+# TOOL 44: remove_yaml_entity
+#
+# Same dry_run-gated preview-then-delete shape as remove_ha_automation /
+# remove_node_red_flow — no diff for a deletion, just an echo of what
+# would be removed. The automatic .bak backup (same as edit/write_file)
+# is the real safety net here, on top of the preview.
+# -----------------------------------------------------------------------
+@mcp.tool()
+def remove_yaml_entity(path: str, entity_name: str, dry_run: bool = True) -> str:
+    """Remove one named entity from a template-style file, leaving everything else untouched.
+
+    path: relative to the allowed base directory.
+    entity_name: the entity's "name" field.
+
+    dry_run controls whether this actually writes anything:
+      - True (default): return the entity's current exact text so you
+        can confirm it's the right one, WITHOUT removing it.
+      - False: actually remove it, with the same automatic .bak backup
+        as edit_yaml_entity/write_file.
+    """
+    try:
+        safe_path = _resolve_safe_path(path)
+    except ValueError as e:
+        return str(e)
+
+    if not safe_path.exists() or not safe_path.is_file():
+        return f"Error: '{path}' does not exist or is not a file."
+
+    try:
+        original_text = safe_path.read_text(encoding="utf-8")
+    except UnicodeDecodeError:
+        return f"Error: '{path}' could not be read as UTF-8 text."
+
+    try:
+        data = _entity_yaml.load(original_text)
+    except Exception as e:
+        return f"Error: '{path}' could not be parsed as YAML: {e}"
+
+    found = _find_yaml_entity(data, entity_name)
+    if not found:
+        return f"Error: no entity named '{entity_name}' found in '{path}'."
+
+    entity, entity_list, idx, domain_key = found
+    original_lines = original_text.splitlines(keepends=True)
+    start, end = _get_yaml_entity_bounds(entity, original_lines)
+
+    if dry_run:
+        return (
+            f"PREVIEW ONLY — nothing removed yet. This entity would be deleted "
+            f"from '{path}':\n\n" + "".join(original_lines[start:end])
+        )
+
+    result_lines = original_lines[:start] + original_lines[end:]
+    new_text = "".join(result_lines)
+
+    backup_path = safe_path.with_suffix(safe_path.suffix + ".bak")
+    backup_note = ""
+    if not backup_path.exists():
+        backup_path.write_bytes(safe_path.read_bytes())
+        backup_note = f" (original backed up to '{backup_path.name}')"
+
+    try:
+        safe_path.write_text(new_text, encoding="utf-8")
+    except OSError as e:
+        return f"Error writing '{path}': {e}"
+
+    return f"Removed entity '{entity_name}' from '{path}'.{backup_note}"
 
 
 # -----------------------------------------------------------------------
