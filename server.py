@@ -58,32 +58,42 @@ mcp = MCPServer("workspace-toolkit")
 # Currently pointed at the Home Assistant config share. Change this one
 # line if you want to point the server somewhere else later.
 # -----------------------------------------------------------------------
-ALLOWED_BASE_DIR = Path(r"\\192.168.2.90\config").resolve()
+ALLOWED_BASE_DIRS = [
+    Path(r"\\192.168.2.90\config").resolve(),
+    Path(r"C:\Users\Rick\Documents\Claude Files").resolve(),
+]
+
+# First one is the default for backwards compatibility with existing
+# Home Assistant calls that pass relative paths like "templates.yaml"
+DEFAULT_BASE_DIR = ALLOWED_BASE_DIRS[0]
 
 
 def _resolve_safe_path(user_path: str) -> Path:
-    """Resolve a user-supplied path and verify it stays inside ALLOWED_BASE_DIR.
+    """Resolve a user-supplied path and verify it stays inside one of ALLOWED_BASE_DIRS.
 
     This is the core safety check reused by every filesystem tool in this
     server. It works in two steps:
-      1. Join the requested path onto ALLOWED_BASE_DIR and resolve it to
-         its full, canonical form (this collapses things like "..").
-      2. Confirm the resolved path is still located inside ALLOWED_BASE_DIR.
+      1. Join the requested path onto DEFAULT_BASE_DIR and resolve it to
+         its full, canonical form. If user_path is already absolute (like
+         a full Windows path C:\\Users\\...\\file.md), Python's Path
+         semantics make the absolute path win over DEFAULT_BASE_DIR.
+      2. Confirm the resolved path is inside at least one of the allowed
+         base directories.
 
-    Raises ValueError if the path would escape the allowed folder — e.g.
-    a request like "..\\..\\Windows\\System32\\config" gets blocked here,
-    even though step 1 would technically resolve it to a real path.
+    Raises ValueError if the path would escape all allowed folders.
     """
-    candidate = (ALLOWED_BASE_DIR / user_path).resolve()
+    candidate = (DEFAULT_BASE_DIR / user_path).resolve()
 
-    if not candidate.is_relative_to(ALLOWED_BASE_DIR):
-        raise ValueError(
-            f"Access denied: '{user_path}' resolves outside the allowed "
-            f"directory ({ALLOWED_BASE_DIR}). This tool can only read "
-            f"files within that folder."
-        )
+    for allowed in ALLOWED_BASE_DIRS:
+        if candidate.is_relative_to(allowed):
+            return candidate
 
-    return candidate
+    allowed_list = "\n  - ".join(str(d) for d in ALLOWED_BASE_DIRS)
+    raise ValueError(
+        f"Access denied: '{user_path}' resolves outside the allowed "
+        f"directories:\n  - {allowed_list}\n"
+        f"This tool can only read files within those folders."
+    )
 
 
 # -----------------------------------------------------------------------
