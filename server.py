@@ -26,6 +26,8 @@ stdin/stdout. See README.md for how to wire it up.
 
 import json
 import os
+import shutil
+from datetime import datetime
 from difflib import unified_diff
 from io import StringIO
 from pathlib import Path
@@ -300,9 +302,17 @@ def read_file(path: str) -> str:
 # first, then act on it. Returns [FILE] / [DIR] prefixes so it's easy to
 # tell at a glance what each entry is, similar to how a normal directory
 # listing tool works.
+#
+# EXTENDED (Nov 2026) with two optional, backward-compatible parameters —
+# existing calls with no extra arguments behave exactly as before:
+#   - recursive: descends into subfolders using the same os.walk +
+#     _SEARCH_SKIP_DIRS pruning search_entity_references already uses,
+#     so it doesn't choke on the same known-noise folders (deps,
+#     backups, tts, etc.) that caused that tool's original timeout.
+#   - show_details: adds file size and last-modified time per entry.
 # -----------------------------------------------------------------------
 @mcp.tool()
-def list_directory(path: str = "") -> str:
+def list_directory(path: str = "", recursive: bool = False, show_details: bool = False) -> str:
     """List the files and subfolders inside a directory.
 
     The path is relative to the server's allowed base directory (the
@@ -313,6 +323,15 @@ def list_directory(path: str = "") -> str:
     Each entry is prefixed with [FILE] or [DIR] so you can tell files
     and subfolders apart. Use this before read_file to find the exact
     filename you're looking for.
+
+    recursive=True descends into subfolders too, showing the full tree
+    instead of just the top level — useful for an overview of a large
+    folder in one call instead of many. Entries are indented by depth,
+    and known-noise folders (deps, backups, tts, etc. — the same list
+    search_entity_references skips) are pruned for speed.
+
+    show_details=True adds each file's size (in bytes) and last-modified
+    time to the listing.
     """
     try:
         safe_path = _resolve_safe_path(path)
@@ -325,16 +344,42 @@ def list_directory(path: str = "") -> str:
     if not safe_path.is_dir():
         return f"Error: '{path}' is a file, not a directory."
 
-    entries = sorted(safe_path.iterdir(), key=lambda p: (p.is_file(), p.name.lower()))
+    def describe(entry: Path) -> str:
+        if not show_details:
+            return ""
+        try:
+            stat = entry.stat()
+        except OSError:
+            return ""
+        if entry.is_file():
+            mtime = datetime.fromtimestamp(stat.st_mtime).isoformat(timespec="seconds")
+            return f" ({stat.st_size} bytes, modified {mtime})"
+        return ""
 
-    if not entries:
-        return f"'{path or '.'}' is empty."
+    if not recursive:
+        entries = sorted(safe_path.iterdir(), key=lambda p: (p.is_file(), p.name.lower()))
+        if not entries:
+            return f"'{path or '.'}' is empty."
+        lines = []
+        for entry in entries:
+            tag = "[FILE]" if entry.is_file() else "[DIR]"
+            lines.append(f"{tag} {entry.name}{describe(entry)}")
+        return "\n".join(lines)
 
     lines = []
-    for entry in entries:
-        tag = "[FILE]" if entry.is_file() else "[DIR]"
-        lines.append(f"{tag} {entry.name}")
+    for dirpath, dirnames, filenames in os.walk(safe_path):
+        dirnames[:] = sorted(d for d in dirnames if d not in _SEARCH_SKIP_DIRS)
+        rel_dir = Path(dirpath).relative_to(safe_path)
+        depth = len(rel_dir.parts) if rel_dir != Path(".") else 0
+        indent = "  " * depth
+        if rel_dir != Path("."):
+            lines.append(f"{indent}[DIR] {rel_dir.name}/")
+        for filename in sorted(filenames):
+            entry = Path(dirpath) / filename
+            lines.append(f"{indent}  [FILE] {filename}{describe(entry)}")
 
+    if not lines:
+        return f"'{path or '.'}' is empty."
     return "\n".join(lines)
 
 
@@ -3086,6 +3131,425 @@ def ha_entities_resource() -> str:
     entities = response.json()
     lines = [f"{e['entity_id']}: {e['state']}" for e in entities]
     return "\n".join(sorted(lines))
+
+
+# -----------------------------------------------------------------------
+# _apply_text_edits
+#
+# Shared logic for edit_file below. Matches the semantics of the device
+# bridge's own built-in Filesystem edit_file tool, since that's exactly
+# what this was suggested to mirror: each edit applies to the result of
+# the ones before it, old_text must match exactly once (line endings
+# aside), and if there's no exact match, a whitespace-tolerant line-by-
+# line fallback is tried — new_text is then re-indented to match what
+# was actually found, same as the built-in tool does.
+# -----------------------------------------------------------------------
+def _apply_text_edits(original_text: str, edits: list):
+    text = original_text
+    for i, edit in enumerate(edits):
+        old_text = edit.get("old_text", "")
+        new_text = edit.get("new_text", "")
+        if not old_text:
+            return None, f"Edit {i + 1}: old_text is empty."
+
+        count = text.count(old_text)
+        if count == 1:
+            text = text.replace(old_text, new_text, 1)
+            continue
+        if count > 1:
+            return None, (
+                f"Edit {i + 1}: old_text matches {count} places in the file — "
+                f"add surrounding lines to make it match exactly once."
+            )
+
+        # No exact match — try a whitespace-tolerant line-by-line match.
+        old_lines = old_text.splitlines()
+        text_lines = text.splitlines(keepends=True)
+        match_start = None
+        match_count = 0
+        for start in range(len(text_lines) - len(old_lines) + 1):
+            window = text_lines[start:start + len(old_lines)]
+            if all(w.strip() == o.strip() for w, o in zip(window, old_lines)):
+                match_start = start
+                match_count += 1
+        if match_count == 1:
+            # Re-indent new_text to match the indentation actually found,
+            # same as the built-in tool's own fallback behavior.
+            first_line = text_lines[match_start]
+            indent = first_line[: len(first_line) - len(first_line.lstrip(" "))]
+            new_lines = new_text.splitlines()
+            reindented = "\n".join(
+                (indent + line if line.strip() else line) for line in new_lines
+            )
+            end = match_start + len(old_lines)
+            text = "".join(text_lines[:match_start]) + reindented + "\n" + "".join(text_lines[end:])
+            continue
+        if match_count > 1:
+            return None, f"Edit {i + 1}: old_text matches {match_count} places even with whitespace-tolerant matching — add more context."
+
+        # No match at all — show nearby lines to help fix old_text.
+        context_hint = ""
+        if old_lines:
+            needle = old_lines[0].strip()
+            for idx, line in enumerate(text_lines):
+                if needle and needle in line:
+                    start_ctx, end_ctx = max(0, idx - 2), min(len(text_lines), idx + 3)
+                    context_hint = "\n\nNearby lines that might help:\n" + "".join(
+                        f"{n + 1}: {text_lines[n]}" for n in range(start_ctx, end_ctx)
+                    )
+                    break
+        return None, f"Edit {i + 1}: old_text was not found in the file.{context_hint}"
+
+    return text, None
+
+
+# -----------------------------------------------------------------------
+# TOOL (new): edit_file
+#
+# A real gap this server had: changing PART of a file (that isn't a
+# template-style entity list, which get_yaml_entity/edit_yaml_entity
+# already handle) required a full write_file overwrite — the whole
+# content, even for a one-line change. This is a general-purpose,
+# targeted alternative for ANY text file, matching the device bridge's
+# own built-in edit_file semantics (suggested by Rob) so the two tools
+# behave the same way from the caller's side.
+# -----------------------------------------------------------------------
+@mcp.tool()
+def edit_file(path: str, edits: list, dry_run: bool = True) -> str:
+    """Make one or more targeted find-and-replace edits to a text file.
+
+    path is relative to the allowed base directory.
+
+    edits is a list of {"old_text": ..., "new_text": ...} objects,
+    applied in order, each to the result of the ones before it. Each
+    old_text must match the file's current content exactly once (line
+    endings aside); if there's no exact match, a whitespace-tolerant
+    line-by-line fallback is tried, re-indenting new_text to match what
+    was found. If any edit matches zero or more than one place, NOTHING
+    is written and the error names which edit failed.
+
+    Use this for a targeted change to part of a file, without retyping
+    the whole thing — unlike write_file's overwrite mode, which replaces
+    everything.
+
+    dry_run controls whether this actually writes anything:
+      - True (default): compute the result and return a unified diff
+        WITHOUT writing. Always call with dry_run=True first.
+      - False: actually write. Backs up the original file to
+        "<name>.bak" first (same one-time-per-session pattern as
+        write_file), if a backup doesn't already exist for it.
+    """
+    try:
+        safe_path = _resolve_safe_path(path)
+    except ValueError as e:
+        return str(e)
+
+    if not safe_path.exists() or not safe_path.is_file():
+        return f"Error: '{path}' does not exist or is not a file."
+
+    try:
+        original_text = safe_path.read_text(encoding="utf-8")
+    except UnicodeDecodeError:
+        return f"Error: '{path}' could not be read as UTF-8 text."
+
+    if not edits:
+        return "Error: edits is empty — nothing to do."
+
+    new_text, error = _apply_text_edits(original_text, edits)
+    if error:
+        return f"Error: {error}"
+
+    if dry_run:
+        diff_lines = list(
+            unified_diff(
+                original_text.splitlines(keepends=True),
+                new_text.splitlines(keepends=True),
+                fromfile=f"{path} (current)",
+                tofile=f"{path} (proposed)",
+            )
+        )
+        if not diff_lines:
+            return f"No changes: the result is identical to the current content of '{path}'."
+        header = f"PREVIEW ONLY — nothing written yet. Diff for '{path}':\n\n"
+        return header + "".join(diff_lines)
+
+    backup_path = safe_path.with_suffix(safe_path.suffix + ".bak")
+    backup_note = ""
+    if not backup_path.exists():
+        backup_path.write_bytes(safe_path.read_bytes())
+        backup_note = f" (original backed up to '{backup_path.name}')"
+
+    try:
+        safe_path.write_text(new_text, encoding="utf-8")
+    except OSError as e:
+        return f"Error writing '{path}': {e}"
+
+    return f"Applied {len(edits)} edit(s) to '{path}'.{backup_note}"
+
+
+# -----------------------------------------------------------------------
+# TOOL (new): read_multiple_files
+#
+# Saves round-trips when several related files are needed at once —
+# e.g. a dashboard view file and the room files it includes. A problem
+# with ONE file is reported inline for that file only; it doesn't stop
+# the rest of the batch from being read.
+# -----------------------------------------------------------------------
+@mcp.tool()
+def read_multiple_files(paths: list) -> str:
+    """Read several files in one call instead of one read_file call per file.
+
+    paths is a list of file paths, each relative to the allowed base
+    directory. Saves round-trips when comparing or cross-referencing
+    several related files at once.
+
+    A problem with ONE file (not found, outside the allowed directory,
+    not valid UTF-8 text) is reported inline for that file only — it
+    does not stop the other files in the batch from being read.
+    """
+    if not paths:
+        return "Error: paths is empty — nothing to read."
+
+    sections = []
+    for p in paths:
+        try:
+            safe_path = _resolve_safe_path(p)
+        except ValueError as e:
+            sections.append(f"=== {p} ===\nError: {e}")
+            continue
+
+        if not safe_path.exists():
+            sections.append(f"=== {p} ===\nError: does not exist.")
+            continue
+        if not safe_path.is_file():
+            sections.append(f"=== {p} ===\nError: is a directory, not a file.")
+            continue
+
+        try:
+            text = safe_path.read_text(encoding="utf-8")
+        except UnicodeDecodeError:
+            sections.append(f"=== {p} ===\nError: could not be read as UTF-8 text.")
+            continue
+
+        sections.append(f"=== {p} ===\n{text}")
+
+    return "\n\n".join(sections)
+
+
+# -----------------------------------------------------------------------
+# TOOL (new): create_directory
+# -----------------------------------------------------------------------
+@mcp.tool()
+def create_directory(path: str, dry_run: bool = True) -> str:
+    """Create a new directory, including any missing parent directories.
+
+    path is relative to the allowed base directory. If the directory
+    already exists, this succeeds without error (same as mkdir -p).
+
+    dry_run controls whether this actually creates anything:
+      - True (default): report whether the directory already exists or
+        would be created, WITHOUT creating it.
+      - False: actually create it (and any missing parents).
+    """
+    try:
+        safe_path = _resolve_safe_path(path)
+    except ValueError as e:
+        return str(e)
+
+    if safe_path.exists():
+        if safe_path.is_dir():
+            return f"'{path}' already exists."
+        return f"Error: '{path}' already exists and is a file, not a directory."
+
+    if dry_run:
+        return f"PREVIEW ONLY — nothing created yet. Would create directory '{path}' (and any missing parent folders)."
+
+    try:
+        safe_path.mkdir(parents=True, exist_ok=True)
+    except OSError as e:
+        return f"Error creating '{path}': {e}"
+
+    return f"Created directory '{path}'."
+
+
+# -----------------------------------------------------------------------
+# TOOL (new): insert_at_line
+#
+# Different from BOTH edit_file (replaces existing text) and write_file's
+# append mode (only adds at the very end) — this inserts new lines at
+# any position without touching what's already there.
+# -----------------------------------------------------------------------
+@mcp.tool()
+def insert_at_line(path: str, line_number: int, content: str, dry_run: bool = True) -> str:
+    """Insert new content before a specific line, without replacing anything.
+
+    path is relative to the allowed base directory. line_number is
+    1-indexed — 1 inserts before the current first line, and
+    (total lines + 1) inserts at the very end (same as append). content
+    is the text to insert; a trailing newline is added automatically if
+    you don't include one.
+
+    dry_run controls whether this actually writes anything:
+      - True (default): compute the result and return a unified diff
+        WITHOUT writing.
+      - False: actually write. Backs up the original file to
+        "<name>.bak" first (same one-time-per-session pattern as
+        write_file), if a backup doesn't already exist for it.
+    """
+    try:
+        safe_path = _resolve_safe_path(path)
+    except ValueError as e:
+        return str(e)
+
+    if not safe_path.exists() or not safe_path.is_file():
+        return f"Error: '{path}' does not exist or is not a file."
+
+    try:
+        original_text = safe_path.read_text(encoding="utf-8")
+    except UnicodeDecodeError:
+        return f"Error: '{path}' could not be read as UTF-8 text."
+
+    lines = original_text.splitlines(keepends=True)
+    total_lines = len(lines)
+
+    if line_number < 1 or line_number > total_lines + 1:
+        return (
+            f"Error: line_number must be between 1 and {total_lines + 1} "
+            f"(the file has {total_lines} line(s)), got {line_number}."
+        )
+
+    insert_text = content if content.endswith("\n") else content + "\n"
+    new_lines = lines[: line_number - 1] + [insert_text] + lines[line_number - 1 :]
+    new_text = "".join(new_lines)
+
+    if dry_run:
+        diff_lines = list(
+            unified_diff(
+                lines, new_lines,
+                fromfile=f"{path} (current)",
+                tofile=f"{path} (proposed)",
+            )
+        )
+        header = f"PREVIEW ONLY — nothing written yet. Diff for '{path}':\n\n"
+        return header + "".join(diff_lines)
+
+    backup_path = safe_path.with_suffix(safe_path.suffix + ".bak")
+    backup_note = ""
+    if not backup_path.exists():
+        backup_path.write_bytes(safe_path.read_bytes())
+        backup_note = f" (original backed up to '{backup_path.name}')"
+
+    try:
+        safe_path.write_text(new_text, encoding="utf-8")
+    except OSError as e:
+        return f"Error writing '{path}': {e}"
+
+    return f"Inserted content before line {line_number} in '{path}'.{backup_note}"
+
+
+# -----------------------------------------------------------------------
+# TOOL (new): delete_file
+#
+# No automatic backup — same precedent remove_ha_automation /
+# remove_ha_script / remove_node_red_flow already set, none of which
+# back anything up either. The dry_run preview is the only safety net,
+# so treat it as mandatory, not optional, before deleting anything real.
+# -----------------------------------------------------------------------
+@mcp.tool()
+def delete_file(path: str, dry_run: bool = True) -> str:
+    """Delete a single file. No undo, no automatic backup — always dry_run first.
+
+    path is relative to the allowed base directory.
+
+    dry_run controls whether this actually deletes anything:
+      - True (default): confirm the file exists and report what would
+        be deleted, WITHOUT deleting it.
+      - False: actually delete it. There is no automatic backup for
+        this operation (unlike write_file's .bak) — copy the file
+        first with read_file, or rename it, if you might want it back.
+
+    Use remove_directory instead for a folder.
+    """
+    try:
+        safe_path = _resolve_safe_path(path)
+    except ValueError as e:
+        return str(e)
+
+    if not safe_path.exists():
+        return f"Error: '{path}' does not exist."
+    if not safe_path.is_file():
+        return f"Error: '{path}' is a directory, not a file. Use remove_directory instead."
+
+    if dry_run:
+        size = safe_path.stat().st_size
+        return f"PREVIEW ONLY — nothing deleted yet. Would delete '{path}' ({size} bytes)."
+
+    try:
+        safe_path.unlink()
+    except OSError as e:
+        return f"Error deleting '{path}': {e}"
+
+    return f"Deleted '{path}'."
+
+
+# -----------------------------------------------------------------------
+# TOOL (new): remove_directory
+#
+# Deletes a directory and EVERYTHING inside it, recursively. Same
+# no-automatic-backup precedent as delete_file above — the dry_run
+# preview (which lists every file that would be removed, not just a
+# count) is the only safety net, so treat it as mandatory in practice.
+# Also refuses to delete an allowed base directory itself — a mistaken
+# empty-path call should never be able to wipe out the whole config
+# share or Claude Files folder.
+# -----------------------------------------------------------------------
+@mcp.tool()
+def remove_directory(path: str, dry_run: bool = True) -> str:
+    """Delete a directory AND EVERYTHING INSIDE IT, recursively. No undo.
+
+    path is relative to the allowed base directory.
+
+    dry_run controls whether this actually deletes anything:
+      - True (default): list every file and subfolder that would be
+        removed, WITHOUT deleting anything. Always call with
+        dry_run=True first and review the full list — this is
+        recursive, so a folder with a lot inside it means a lot gets
+        deleted at once.
+      - False: actually delete the directory and all its contents.
+        There is no automatic backup for this operation.
+
+    Use delete_file instead for a single file. Refuses to delete an
+    allowed base directory itself.
+    """
+    try:
+        safe_path = _resolve_safe_path(path)
+    except ValueError as e:
+        return str(e)
+
+    if not safe_path.exists():
+        return f"Error: '{path}' does not exist."
+    if not safe_path.is_dir():
+        return f"Error: '{path}' is a file, not a directory. Use delete_file instead."
+    if safe_path in ALLOWED_BASE_DIRS:
+        return "Error: refusing to delete an allowed base directory itself."
+
+    contents = sorted(p.relative_to(safe_path) for p in safe_path.rglob("*"))
+
+    if dry_run:
+        if not contents:
+            return f"PREVIEW ONLY — nothing deleted yet. '{path}' is an empty directory and would be removed."
+        listing = "\n".join(f"  {c}" for c in contents)
+        return (
+            f"PREVIEW ONLY — nothing deleted yet. Deleting '{path}' would remove "
+            f"{len(contents)} item(s) inside it, plus the folder itself:\n\n{listing}"
+        )
+
+    try:
+        shutil.rmtree(safe_path)
+    except OSError as e:
+        return f"Error deleting '{path}': {e}"
+
+    return f"Deleted '{path}' and everything inside it ({len(contents)} item(s))."
 
 
 # -----------------------------------------------------------------------

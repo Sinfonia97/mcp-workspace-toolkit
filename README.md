@@ -10,7 +10,7 @@ alongside the 2026-07-28 MCP spec revision).
 
 ## What this server does
 
-`server.py` exposes 45 tools and 2 resources to any connected MCP
+`server.py` exposes 51 tools and 2 resources to any connected MCP
 client (Claude Desktop, the Inspector, or any other MCP-compatible
 client). All Home Assistant filesystem tools are scoped to the config
 share defined by `ALLOWED_BASE_DIR`, nothing outside it is reachable.
@@ -27,8 +27,14 @@ share defined by `ALLOWED_BASE_DIR`, nothing outside it is reachable.
 | Tool | What it does |
 |---|---|
 | `read_file(path)` | Reads a text file's full contents. |
-| `list_directory(path="")` | Lists files/subfolders, prefixed `[FILE]`/`[DIR]`. |
+| `read_multiple_files(paths)` | Reads several files in one call. A problem with one file doesn't stop the rest of the batch. |
+| `list_directory(path="", recursive=False, show_details=False)` | Lists files/subfolders, prefixed `[FILE]`/`[DIR]`. `recursive=True` descends the whole tree (pruning the same known-noise folders `search_entity_references` skips); `show_details=True` adds size and last-modified time per file. |
 | `write_file(path, content, mode="overwrite", dry_run=True)` | Writes or appends to a file. Defaults to preview only, returns a diff and writes nothing until called with `dry_run=False`. Backs up the original to `<name>.bak` once per session before a real write. |
+| `edit_file(path, edits, dry_run=True)` | Targeted find-and-replace edits (a list of `{old_text, new_text}` pairs, applied in order) without retyping the whole file. Matches the device bridge's own built-in `edit_file` semantics: exact match required, with a whitespace-tolerant fallback. Same backup pattern as `write_file`. |
+| `insert_at_line(path, line_number, content, dry_run=True)` | Inserts new content before a specific line, without replacing anything. Same backup pattern as `write_file`. |
+| `create_directory(path, dry_run=True)` | Creates a directory, including any missing parents. |
+| `delete_file(path, dry_run=True)` | Deletes a single file. No automatic backup. |
+| `remove_directory(path, dry_run=True)` | Deletes a directory and everything inside it, recursively. No automatic backup, and refuses to delete an allowed base directory itself. |
 | `search_entity_references(entity_id, subfolder="", max_results=50)` | Searches YAML files and UI-built dashboard cards for references to an entity ID. Labels results `[Config]` or `[Dashboard card]`. Also works as a plain substring search across YAML files. |
 
 ### Single-entity YAML editing
@@ -284,8 +290,9 @@ conversation.
 
 ## Safety design
 
-- Preview before commit. `write_file`, `edit_yaml_entity`,
-  `add_yaml_entity`, `save_ha_dashboard_config`,
+- Preview before commit. `write_file`, `edit_file`, `insert_at_line`,
+  `edit_yaml_entity`, `add_yaml_entity`, `create_directory`,
+  `delete_file`, `remove_directory`, `save_ha_dashboard_config`,
   `save_ha_automation_config`, `save_ha_script_config`,
   `save_node_red_flows`/`save_node_red_flow`, `create_node_red_flow`,
   and every install/enable/remove tool default to `dry_run=True`. An
@@ -295,12 +302,13 @@ conversation.
   and refuse to reload if it fails. Automation/script/dashboard saves
   are validated server-side by Home Assistant itself on write.
 - Automatic backups, but only for file writes. `write_file`,
-  `edit_yaml_entity`, `add_yaml_entity`, and `remove_yaml_entity` back
-  up the pre-edit file to `<name>.bak` once per session before
-  changing it. Deletions that go through an API instead of a file
-  (`remove_ha_automation`, `remove_ha_script`, `remove_node_red_flow`,
-  `remove_node_red_node`) have no automatic backup. The dry-run preview
-  is the only safety net for those, treat it as mandatory.
+  `edit_file`, `insert_at_line`, `edit_yaml_entity`, `add_yaml_entity`,
+  and `remove_yaml_entity` back up the pre-edit file to `<name>.bak`
+  once per session before changing it. Deletions (`remove_ha_automation`,
+  `remove_ha_script`, `remove_node_red_flow`, `remove_node_red_node`,
+  `delete_file`, `remove_directory`) have no automatic backup, whether
+  they go through an API or the filesystem directly. The dry-run
+  preview is the only safety net for those, treat it as mandatory.
 - Scoped access. Every filesystem tool is confined to
   `ALLOWED_BASE_DIR`, path traversal attempts (`../..`) are rejected.
 - Entity-level edits never touch the whole file. `edit_yaml_entity`/
@@ -430,6 +438,15 @@ Roughly the order things were added:
     from ruamel's own comment-preservation metadata. Validated
     end-to-end against a real, complex template file before being
     trusted.
+17. `edit_file`, `read_multiple_files`, `create_directory`,
+    `insert_at_line`, `delete_file`, `remove_directory`, and an
+    extended `list_directory` (recursive, with file sizes/mtimes) —
+    general-purpose file primitives suggested from outside the project,
+    filling real gaps (no targeted edit, no batch read, no way to
+    create or delete anything) rather than duplicating what already
+    existed. `edit_file` deliberately matches the device bridge's own
+    built-in Filesystem tool's semantics rather than inventing a new
+    convention.
 
 ## Where this could go next
 
